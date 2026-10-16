@@ -19,7 +19,7 @@ patch_k2p_wifi_defaults.py
    `WmmCapable=0`，也就是**主路由侧 WMM 是关的**；AP 侧一旦开 WMM，
    作为 STA 去关联「不开 WMM 的 AP」会失败 —— 实测把 AP1 的 wl_wme 改成 1
    直接失联并触发看门狗重启。所以两边都关才是能工作的组合。
-   注意：只改 5G 的 `wl_wme`，**不动 2.4G 的 `rt_wme`**（AP 上 2.4G 是 `rt_wme=1`）。
+   注意：只改 5G 的 `wl_wme`；2.4G 的 `rt_wme` 见第 6 条。
 
 3) `wl_country_code` : 默认值 -> 固定 "CN"
    两台 AP 实测都是 CN。原默认是 `DEF_WLAN_5G_CC`（注释写着 "default obtained from driver"），
@@ -32,6 +32,19 @@ patch_k2p_wifi_defaults.py
    一个人尽皆知的弱口令）。这两条把它删掉，让 2.4G / 5G **出厂即开放网络**（无密码）。
    做法照抄 Padavan 自己的访客网络默认值（`wl_guest_auth_mode="open"` +
    `wl_guest_wpa_psk=""`），是这套固件里已有、能正常工作的组合。
+
+6) `rt_wme`     : 1(开) -> 0(关)   【v2 新增：2.4G 对齐 QWRT】
+   QWRT 主路由 2.4G 的 WMM 也是关的（WmmCapable=0，两频段一致）。
+   现在 AP 的 2.4G 是回程 STA（连 QWRT 的「毛毛2.4g」），5G 上实测过的教训
+   （wl_wme=1 → apcli0 关联失败 → 失联+看门狗重启）同样适用于 2.4G：
+   STA 侧开着 WMM 去关联一个 WMM 关闭的 AP 是隐患。两边都关。
+
+7) `rt_country_code` : 默认(DEF_WLAN_2G_CC) -> 固定 "CN"
+   与 5G 的 wl_country_code 对齐，两频段恢复出厂都是 CN。
+
+8) `rt_channel` : 0(auto) -> 11   【v3 新增：2.4G 信道默认钉 11】
+   实测 AP1 的 2.4G 回程钉在 ch11（与主路由 2.4G 对齐、且避开邻里干扰）。
+   恢复出厂即 ch11，不用再手工选。只影响 K2P。
 
    ⚠️ 只影响「恢复出厂 / 不保留配置刷机」之后的初始状态：
       * 「保留配置」刷机时 nvram 不动，手上已设好密码的机器**完全不受影响**；
@@ -202,6 +215,51 @@ def main():
     else:
         print("[跳过] 按配置不钉国家码")
 
+    # ---------- 3b) rt_country_code (2.4G) ----------
+    if PIN_COUNTRY_CN:
+        if re.search(r'(?m)^[ \t]*\{ "rt_country_code", "CN" \},', src):
+            print("[跳过] rt_country_code 已经是 CN")
+        else:
+            src, msg = wrap_k2p_any(
+                src,
+                '{ "rt_country_code", DEF_WLAN_2G_CC },',
+                '{ "rt_country_code", "CN" },',
+                "\t\t/* Country Code — K2P：固定 CN（与 5G 对齐） */",
+                "rt_country_code(2.4G)",
+            )
+            print("[%s]" % msg)
+            changed.append('rt_country_code=CN')
+    else:
+        print("[跳过] 按配置不钉 2.4G 国家码")
+
+    # ---------- 3c) rt_wme (2.4G) ----------
+    if re.search(r'(?m)^[ \t]*\{ "rt_wme", "0" \},', src):
+        print("[跳过] rt_wme 已经是 0")
+    else:
+        src, msg = wrap_k2p_any(
+            src,
+            '{ "rt_wme", "1" },',
+            '{ "rt_wme", "0" },',
+            "\t\t\t/* WME mode — K2P：2.4G 对齐 QWRT（WMM 关），回程 STA 关联无隐患 */",
+            "rt_wme(2.4G)",
+        )
+        print("[%s]" % msg)
+        changed.append("rt_wme=0")
+
+    # ---------- 3d) rt_channel (2.4G) ----------
+    if re.search(r'(?m)^[ \t]*\{ "rt_channel", "11" \},', src):
+        print("[跳过] rt_channel 已经是 11")
+    else:
+        src, msg = wrap_k2p_any(
+            src,
+            '{ "rt_channel", "0" },',
+            '{ "rt_channel", "11" },',
+            "\t\t/* Channel — K2P：2.4G 默认钉 11（对齐实测回程信道） */",
+            "rt_channel(2.4G)",
+        )
+        print("[%s]" % msg)
+        changed.append("rt_channel=11")
+
     # ---------- 4) 5) 出厂 2.4G / 5G 删掉预置口令（默认开放）----------
     OPEN_JOBS = [
         ('{ "wl_auth_mode", "psk" },',
@@ -260,6 +318,19 @@ def main():
 
     if PIN_COUNTRY_CN and not re.search(r'(?m)^[ \t]*\{ "wl_country_code", "CN" \},', src):
         fail("校验失败：找不到 K2P 的 wl_country_code=CN")
+
+    if PIN_COUNTRY_CN and not re.search(r'(?m)^[ \t]*\{ "rt_country_code", "CN" \},', src):
+        fail("校验失败：找不到 K2P 的 rt_country_code=CN")
+
+    if re.search(r'(?m)^[ \t]*\{ "rt_wme", "0" \},', src):
+        print("[校验] rt_wme  -> 0（K2P 分支）✓")
+    else:
+        fail("校验失败：找不到 K2P 的 rt_wme=0")
+
+    if re.search(r'(?m)^[ \t]*\{ "rt_channel", "11" \},', src):
+        print("[校验] rt_channel  -> 11（K2P 分支）✓")
+    else:
+        fail("校验失败：找不到 K2P 的 rt_channel=11")
 
     if OPEN_DEFAULT_WIFI:
         for need in ('{ "wl_auth_mode", "open" },', '{ "wl_wpa_psk", "" },',
