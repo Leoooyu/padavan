@@ -1,0 +1,394 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+在 Padavan 源码树里给 mtd_storage.sh 打补丁（供 GitHub Actions 调用）。
+
+做两件事：
+  1) 定义 func_tsl_fixes()：
+     - 写入 /etc/storage/ap_watchdog.sh（**通用版**看门狗：探测目标 = 本机实际默认网关，
+       默认每 5 分钟一次，一次不通即重启；带 MIN_UPTIME 护栏防打转）
+       * 脚本头带 `watchdog-version: v4-generic` 标记，旧版会自动升级
+       * 重启逻辑移植自 QWRT：graceful = 优雅重启 + 6 秒 sysrq 兜底（默认）
+     - 写入 /etc/storage/reboot-hard.sh（QWRT 的 /usr/bin/reboot-hard：内核级紧急重启）
+     - 写入 /etc/storage/reboot-safe.sh（QWRT 的 /sbin/reboot 包装器：优雅优先 + 兜底）
+     - 给 started_script.sh 追加启动钩子（pid 文件 + start-stop-daemon，不依赖 cron）
+     - 给 shutdown_script.sh 追加 sysrq 兜底（正常关机优先，卡住 6 秒强制重启）
+  2) 在 case "$1" 的 load) / reset) / fill) 分支里调用这个块，保证
+     - 首次开机（fill/reset）就写进去
+     - 每次开机（load）都会补齐缺失项（幂等：grep / 版本标记守卫）
+
+追加内容全部是"只新增、不改动原有逻辑"，安全可回滚（同目录留 .orig 备份）。
+"""
+import os
+import re
+import sys
+
+MARK = "# ===== tsl baked-in fixes (watchdog + reliable reboot) ====="
+
+# FIXME: 下面这个 BLOCK 是一整段 shell（含内嵌 heredoc），原样保留，不要格式化。
+BLOCK = r'''
+# ===== tsl baked-in fixes (watchdog + reliable reboot) =====
+# 通用版桥接看门狗 + QWRT 式重启（优雅优先 + sysrq 兜底）。只新增文件/追加内容，不改动原有逻辑。
+func_tsl_fixes()
+{
+	WD="/etc/storage/ap_watchdog.sh"
+	# 带版本标记：缺失或旧版时自动写入/升级；已是 v4 就不动
+	if [ ! -f "$WD" ] || ! grep -q "watchdog-version: v4-generic" "$WD" ; then
+		cat > "$WD" <<'TSLEOF'
+#!/bin/sh
+# ================= 桥接看门狗（通用版）=================
+# 上级路由失联 -> 重启本机。由 install-ap-fixes.py 安装。
+# watchdog-version: v4-generic
+#
+# 重启逻辑移植自之前的 QWRT 固件（MTK 平台正常关机流程可能卡死）：
+#   graceful = 优雅重启优先，同时武装一个内核级兜底定时器
+#              （对应 QWRT 的 /sbin/reboot 包装器）
+#   hard     = 直接内核级 sysrq 重启（对应 QWRT 的 /usr/bin/reboot-hard）
+#
+# 可调参数（只改这一段即可）：
+GW_OVERRIDE=""	# 留空 = 自动取本机默认网关；也可写死，如 "192.168.2.1"
+INTERVAL=300		# 检查间隔（秒）：300 = 5 分钟，600 = 10 分钟
+MISS_LIMIT=1		# 连续几轮不通就重启：1 = 一次不通就重启
+PING_TRIES=3		# 一轮内最多试几次（每次 2 个包、2 秒超时）
+SOFT_FIRST=0		# 1 = 重启前先试软恢复（重启无线 + 补挂网桥，多花约 30 秒）
+MIN_UPTIME=300		# 本机启动不足这么多秒时，不通也不重启（防打转）
+REBOOT_MODE="graceful"	# graceful = 优雅重启 + sysrq 兜底；hard = 直接 sysrq（QWRT 的 reboot-hard）
+SYSRQ_GRACE=6		# graceful：等这么多秒还没关机就发内核级重启（与 QWRT 一致）
+# ======================================================
+
+CNTF=/tmp/ap_watchdog.cnt
+TAG=apwd
+
+log() { logger -t $TAG "$*" ; }
+
+# 取探测目标：优先本机实际默认网关（默认路由）
+get_gw() {
+	if [ -n "$GW_OVERRIDE" ] ; then
+		echo "$GW_OVERRIDE"
+		return
+	fi
+	g=$(ip route 2>/dev/null | awk '/^default/ {print $3; exit}')
+	[ -n "$g" ] || g=$(route -n 2>/dev/null | awk '$1=="0.0.0.0" {print $2; exit}')
+	echo "$g"
+}
+
+uptime_sec() { awk '{print int($1)}' /proc/uptime 2>/dev/null ; }
+
+# 一轮内多试几次，避免"丢一个包"就判失联
+alive() {
+	i=1
+	while [ "$i" -le "$PING_TRIES" ] ; do
+		ping -c 2 -W 2 "$1" >/dev/null 2>&1 && return 0
+		i=$((i + 1))
+	done
+	return 1
+}
+
+# 软恢复：重启 5G 无线（桥接用的 apcli0 在 5G 上），再补挂一次网桥
+soft_recover() {
+	[ -x /sbin/radio2_restart ] && /sbin/radio2_restart
+	sleep 20
+	for i in apcli0 ra0 rax0 ; do
+		[ -e "/sys/class/net/$i" ] && brctl addif br0 "$i" 2>/dev/null
+	done
+	log "soft wireless restart done"
+}
+
+# 内核级紧急重启（对应 QWRT 的 /usr/bin/reboot-hard）：
+# 跳过 init / 服务关闭 / 驱动卸载，是本机唯一一定生效的重启方式。
+# 先 's' 同步一次、留 1 秒回写，再 'b' 立即重启（与 QWRT 的写法一致）。
+sysrq_reboot() {
+	echo 1 > /proc/sys/kernel/sysrq
+	echo s > /proc/sysrq-trigger
+	sleep 1
+	echo b > /proc/sysrq-trigger
+}
+
+# 重启入口（对应 QWRT 的 /sbin/reboot 包装器）：
+# 优雅重启优先，**同一时刻**武装一个 SYSRQ_GRACE 秒的内核级兜底定时器。
+# 这样即使关机流程卡死、或 reboot 静默失败，定时器也会把机器真正重启掉。
+do_reboot() {
+	sync
+	case "$REBOOT_MODE" in
+		hard|sysrq)
+			log "REBOOT: hard (sysrq, skip init)"
+			sysrq_reboot
+			;;
+		*)
+			log "REBOOT: graceful, sysrq fallback in ${SYSRQ_GRACE}s"
+			# trap 必须忽略 TERM/INT/HUP：/sbin/rc 的关机流程走完后，init 会执行
+			# kill(-1, SIGTERM)（向所有进程广播），不忽略的话这个后台兜底会被一起杀掉
+			# —— 真机实测过：无 trap 的 subshell 收到 TERM 后，后面的命令一条都不执行。
+			# 延时用"等绝对时刻"而不是裸 sleep：kill(-1) 会连 sleep 子进程一起收掉，
+			# 光靠 sleep 会立刻返回、导致兜底提前触发。
+			(
+				trap '' TERM INT HUP
+				_d=$(( $(date +%s) + SYSRQ_GRACE ))
+				while [ "$(date +%s)" -lt "$_d" ] ; do sleep 1 2>/dev/null ; done
+				sysrq_reboot
+			) &
+			reboot
+			;;
+	esac
+}
+
+check_once() {
+	gw=$(get_gw)
+	if [ -z "$gw" ] ; then
+		# 取不到网关（例如刚开机还没起路由）时不算失联，避免误重启
+		log "no default gateway -> skip this round"
+		return 0
+	fi
+
+	if alive "$gw" ; then
+		[ -f "$CNTF" ] && rm -f "$CNTF"
+		return 0
+	fi
+
+	n=$(cat "$CNTF" 2>/dev/null)
+	[ -z "$n" ] && n=0
+	n=$((n + 1))
+	echo "$n" > "$CNTF"
+	log "uplink $gw unreachable (round $n/$MISS_LIMIT)"
+
+	if [ "$n" -lt "$MISS_LIMIT" ] ; then
+		soft_recover
+		return 0
+	fi
+
+	if [ "$SOFT_FIRST" = "1" ] ; then
+		soft_recover
+		if alive "$gw" ; then
+			log "soft recovery worked -> no reboot"
+			rm -f "$CNTF"
+			return 0
+		fi
+		log "soft recovery failed"
+	fi
+
+	up=$(uptime_sec)
+	if [ -n "$up" ] && [ "$up" -lt "$MIN_UPTIME" ] ; then
+		log "uptime ${up}s < ${MIN_UPTIME}s -> skip reboot (防打转)"
+		rm -f "$CNTF"
+		return 0
+	fi
+
+	rm -f "$CNTF"
+	log "uplink $gw down -> rebooting AP now"
+	do_reboot
+	return 0
+}
+
+case "$1" in
+	--gw)	get_gw ; exit 0 ;;
+	--once)	check_once ; echo "checked once (gw=$(get_gw))" ; exit 0 ;;
+	--reboot)	do_reboot ; exit 0 ;;
+	*)	while true ; do
+			check_once
+			sleep "$INTERVAL"
+		done ;;
+esac
+TSLEOF
+		chmod 755 "$WD"
+	fi
+	HB="/etc/storage/reboot-hard.sh"
+	if [ ! -f "$HB" ] || ! grep -q "qwrt-reboot-hard: v1" "$HB" ; then
+		cat > "$HB" <<'TSLEOF'
+#!/bin/sh
+# ================= 内核级紧急重启 =================
+# qwrt-reboot-hard: v1   （移植自 QWRT 固件的 /usr/bin/reboot-hard）
+# 跳过 init、服务关闭、驱动卸载 —— 本机（MTK）正常关机流程可能卡住，
+# 卡住时只有这个能真正重启。
+# 用法: sh /etc/storage/reboot-hard.sh
+sync
+echo 1 > /proc/sys/kernel/sysrq
+echo s > /proc/sysrq-trigger
+sleep 1
+echo b > /proc/sysrq-trigger
+TSLEOF
+		chmod 755 "$HB"
+	fi
+	SB="/etc/storage/reboot-safe.sh"
+	if [ ! -f "$SB" ] || ! grep -q "qwrt-reboot-safe: v2" "$SB" ; then
+		cat > "$SB" <<'TSLEOF'
+#!/bin/sh
+# ================= 优雅重启 + 自动兜底 =================
+# qwrt-reboot-safe: v2   （移植自 QWRT 固件的 /sbin/reboot 包装器）
+# 先走正常关机；GRACE 秒后机器还活着（关机流程卡住 / reboot 没生效），
+# 自动转内核级强制重启 —— 保证"重启一定发生"。
+# Padavan 的 / 是只读 squashfs，换不掉 /sbin/reboot，所以放在这里。
+# v2 加固：兜底 subshell 忽略 TERM/INT/HUP —— 关机流程里 init 会 kill(-1, SIGTERM)，
+#          不忽略就会被一起杀掉；延时改"等绝对时刻"，避免 sleep 被连带杀死后提前触发。
+# 用法: sh /etc/storage/reboot-safe.sh
+GRACE=6
+sync
+(
+	trap '' TERM INT HUP
+	_d=$(( $(date +%s) + GRACE ))
+	while [ "$(date +%s)" -lt "$_d" ] ; do sleep 1 2>/dev/null ; done
+	echo 1 > /proc/sys/kernel/sysrq
+	echo s > /proc/sysrq-trigger
+	echo b > /proc/sysrq-trigger
+) &
+reboot
+TSLEOF
+		chmod 755 "$SB"
+	fi
+	# ---- 启动钩子（started_script.sh）----
+	# 文件不存在就先按官方模板补齐。官方是在 func_fill() 里生成的，而 load) 分支
+	# 只调 func_load()（纯解包，不补文件）—— 极端情况下（storage 被手动清过）
+	# 钩子会被静默跳过，所以这里自己兜一层。
+	ST="/etc/storage/started_script.sh"
+	if [ ! -f "$ST" ] ; then
+		printf '#!/bin/sh\n\n### Custom user script\n### Called after router started and network is ready\n\n' > "$ST"
+		chmod 755 "$ST"
+	fi
+	if ! grep -q ap_watchdog "$ST" ; then
+		cat >> "$ST" <<'TSLEOF'
+
+# ==== AP 桥接看门狗（由安装脚本写入；本体见 /etc/storage/ap_watchdog.sh）====
+# Padavan 没有 setsid：用 pid 文件 + start-stop-daemon 脱离会话
+# （实测直接 `( ... ) &` 起的后台任务会随 SSH 会话被回收）。
+# 守卫用 kill -0 探测 pid —— busybox 的 `ps w` 会截断过长命令行，grep 守卫会误判。
+PIDF=/var/run/ap_watchdog.pid
+if [ ! -s "$PIDF" ] || ! kill -0 "$(cat "$PIDF" 2>/dev/null)" 2>/dev/null ; then
+	start-stop-daemon -S -b -m -p "$PIDF" -x /bin/sh -- -c '/etc/storage/ap_watchdog.sh'
+fi
+TSLEOF
+	fi
+	# ---- 关机兜底（v2 加固）----
+	# 这是**所有**重启路径的最后一道保险：手动重启、网页重启、看门狗重启，
+	# 以及「高级设置 > 系统管理 > 其他设置」里那个**自带定时重启**
+	# （watchdog.c 的 reboot_schedule -> sys_exit() -> kill(1,SIGTERM)
+	#   -> init 关机 -> 执行本脚本），全都要经过这里。
+	# 所以把它做扎实 = 把整条重启链做扎实。
+	# v1 会被 init 随后的 kill(-1, SIGTERM) 干掉，v2 起用 trap 免疫。
+	SH="/etc/storage/shutdown_script.sh"
+	# 文件不存在就先按官方模板补齐（同 started_script.sh 的理由）。
+	if [ ! -f "$SH" ] ; then
+		cat > "$SH" <<'TSLEOF'
+#!/bin/sh
+
+### Custom user script
+### Called before router shutdown
+### $1 - action (0: reboot, 1: halt, 2: power-off)
+
+TSLEOF
+		chmod 755 "$SH"
+	fi
+	if ! grep -q "sysrq-fallback: v2" "$SH" ; then
+		# 先摘掉历史版本（v1/v2/更早的三秒版都可能残留），再重写。
+		# 判据**只用 ASCII**：先找含 `sysrq-trigger` 的那行，向上回溯到最近的 `if` 行
+		# 及其紧邻的注释行 = 块首；向下找第一个独立的 `fi` 行 = 块尾（v2 还要吃掉
+		# 紧随其后的 `# <<< sysrq-fallback <<<` 结束标记）。
+		# 为什么要缓冲整个文件：需要"向前看"再整体重排，单遍 awk 做不到删块。
+		# 为什么不用中文正则（如 /^# reboot 兜底/）：虽然实测 busybox awk 认得，
+		# 但 CJK 匹配依赖 locale/编码，换个 busybox 就可能失效 —— ASCII 判据无此风险。
+		awk '
+			{ L[NR] = $0 ; F[NR] = $1 ; N[NR] = NF }
+			END {
+				k = 0
+				for (i = 1; i <= NR; i++)
+					if (index(L[i], "sysrq-trigger")) { k = i ; break }
+				if (!k) { for (i = 1; i <= NR; i++) print L[i] ; exit }
+				# 块首：从 k 往上找最近的 if 行，再吃掉紧邻的注释行
+				s = k
+				for (i = k; i >= 1; i--)
+					if (F[i] == "if") { s = i ; break }
+				# 注释行判据用 L[]（整行）而不是 F[]：块里有"只有 # 一行"的空注释，
+				# 那种行 NF=0、$1 为空，用字段判断会提前停下、导致块头残留。
+				# 用 POSIX 字符类 [[:space:]] 而不是 \\t —— \\t 在方括号里不可移植。
+				while (s > 1 && L[s-1] ~ /^[[:space:]]*#/) s--
+				# 块尾：从 k 往下找第一个"整行只有 fi"
+				e = NR
+				for (i = k; i <= NR; i++)
+					if (F[i] == "fi" && N[i] == 1) { e = i ; break }
+				# v2 的结束标记要跟着块一起删，否则每次升级都多留一行
+				if (e < NR && L[e+1] ~ /^[[:space:]]*#/ && index(L[e+1], "sysrq-fallback")) e++
+				for (i = 1; i < s; i++) print L[i]
+				for (i = e + 1; i <= NR; i++) print L[i]
+			}
+		' "$SH" > "/tmp/_sh_new.$$" \
+			&& [ -s "/tmp/_sh_new.$$" ] && cat "/tmp/_sh_new.$$" > "$SH" && rm -f "/tmp/_sh_new.$$"
+		cat >> "$SH" <<'TSLEOF'
+
+# >>> sysrq-fallback: v2 >>>
+# reboot 兜底（由固件/脚本安装）：正常关机优先，卡住 6 秒后用内核 sysrq 强制重启。
+# 只对「重启」动作生效（$1=0），停机和关电不会误触发。
+#
+# 为什么必须 trap：init 跑完关机脚本后会执行 kill(-1, SIGTERM) 广播 SIGTERM，
+# 不加 trap 的话这个后台兜底会被一起杀掉、等于没装（真机实测：无 trap 的 subshell
+# 收到 TERM 后，后面的命令一条都不执行）。trap 之后 init 就杀不动它了。
+# 为什么用时间戳：kill(-1) 会把 sleep 子进程一起收掉，裸 sleep 会立刻返回、
+# 导致兜底提前触发；改成"等一个绝对时刻"，无论中途被打断几次都保证等够 6 秒。
+if [ "$1" = "0" ] ; then
+	sync
+	(
+		trap '' TERM INT HUP
+		_end=$(( $(date +%s) + 6 ))
+		while [ "$(date +%s)" -lt "$_end" ] ; do sleep 1 2>/dev/null ; done
+		echo 1 > /proc/sys/kernel/sysrq
+		echo s > /proc/sysrq-trigger
+		echo b > /proc/sysrq-trigger
+	) &
+fi
+# <<< sysrq-fallback <<<
+TSLEOF
+		chmod 755 "$SH"
+	fi
+	# 立刻起一次（不等下次重启）：pid 文件 + start-stop-daemon（本机无 setsid，& 会随会话被回收）
+	if [ ! -s "/var/run/ap_watchdog.pid" ] || ! kill -0 "$(cat /var/run/ap_watchdog.pid 2>/dev/null)" 2>/dev/null ; then
+		start-stop-daemon -S -b -m -p "/var/run/ap_watchdog.pid" -x /bin/sh -- -c '/etc/storage/ap_watchdog.sh'
+	fi
+}
+# ===== end of tsl baked-in fixes =====
+'''
+
+
+def main():
+    path = sys.argv[1] if len(sys.argv) > 1 else None
+    if not path:
+        # 自己找
+        for root, _dirs, files in os.walk("trunk"):
+            for f in files:
+                if f.endswith("mtd_storage.sh"):
+                    path = os.path.join(root, f)
+                    break
+            if path:
+                break
+    if not path or not os.path.isfile(path):
+        print("找不到 mtd_storage.sh")
+        return 1
+    print("打补丁:", path)
+    src = open(path, encoding="utf-8", errors="surrogateescape").read()
+    if MARK in src:
+        print("已经打过补丁，跳过")
+        return 0
+    orig = src
+
+    # 1) 插入函数定义（放在 func_fill 之前，确保被调用时已定义）
+    m = re.search(r"(?m)^func_fill\(\)", src)
+    if not m:
+        print("找不到 func_fill()，放弃")
+        return 1
+    src = src[:m.start()] + BLOCK.strip("\n") + "\n\n" + src[m.start():]
+
+    # 2) 在 case 的 load) / reset) / fill) 分支里调用
+    #    load) 里跟在 func_load 后面；reset)/fill) 里跟在 func_fill 后面
+    src = src.replace("\tfunc_load\n", "\tfunc_load\n\tfunc_tsl_fixes\n", 1)
+    src = src.replace("\tfunc_fill\n", "\tfunc_fill\n\tfunc_tsl_fixes\n")
+    if "func_tsl_fixes" not in src.split('case "$1" in', 1)[-1]:
+        print("警告：没有挂到 case 分支上，请手工检查")
+        return 1
+
+    # newline="" -> 写文件时不做任何换行转换，保证与源码树行尾一致（上游是 LF）。
+    # 若不写，在 Windows 上跑补丁会把整个文件转成 CRLF：shell 脚本每行尾带 \r，
+    # 真机上会出现 `#!/bin/sh\r` 之类的怪错误（本地实测过 722 行 → 944 行全变 CRLF）。
+    open(path + ".orig", "w", encoding="utf-8", errors="surrogateescape", newline="").write(orig)
+    open(path, "w", encoding="utf-8", errors="surrogateescape", newline="").write(src)
+    print("已写入（原文件备份为 %s.orig）" % path)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
