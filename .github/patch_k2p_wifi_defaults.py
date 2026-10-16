@@ -46,6 +46,11 @@ patch_k2p_wifi_defaults.py
    实测 AP1 的 2.4G 回程钉在 ch11（与主路由 2.4G 对齐、且避开邻里干扰）。
    恢复出厂即 ch11，不用再手工选。只影响 K2P。
 
+9) `rt_HT_80211KV` : 1(开) -> 0(关)   【v4 新增：2.4G KV 关，对齐 QWRT】
+   主路由 QWRT 2.4G 实测 k=0、v=0（K/V 关）。Padavan 出厂 rt_HT_80211KV=1。
+   2.4G 只做回程、不服务客户端，KV 开关本无收益，且与上游对齐避免异常。
+   注意只改 2.4G 的 rt_HT_80211KV；5G 的 wl_HT_80211KV 保持 1（5G 要 K/V 漫游）。
+
    ⚠️ 只影响「恢复出厂 / 不保留配置刷机」之后的初始状态：
       * 「保留配置」刷机时 nvram 不动，手上已设好密码的机器**完全不受影响**；
       * 也**不影响**无线回程（apcli0）—— 上级 SSID/口令走 `wl_sta_ssid` /
@@ -260,6 +265,20 @@ def main():
         print("[%s]" % msg)
         changed.append("rt_channel=11")
 
+    # ---------- 3e) rt_HT_80211KV (2.4G KV) ----------
+    if re.search(r'(?m)^[ \t]*\{ "rt_HT_80211KV", "0" \},', src):
+        print("[跳过] rt_HT_80211KV 已经是 0")
+    else:
+        src, msg = wrap_k2p_any(
+            src,
+            '{ "rt_HT_80211KV", "1" },',
+            '{ "rt_HT_80211KV", "0" },',
+            "\t\t/* 802.11K/V — K2P：2.4G 只做回程，KV 关，对齐 QWRT */",
+            "rt_HT_80211KV(2.4G)",
+        )
+        print("[%s]" % msg)
+        changed.append("rt_HT_80211KV=0")
+
     # ---------- 4) 5) 出厂 2.4G / 5G 删掉预置口令（默认开放）----------
     OPEN_JOBS = [
         ('{ "wl_auth_mode", "psk" },',
@@ -331,6 +350,11 @@ def main():
         print("[校验] rt_channel  -> 11（K2P 分支）✓")
     else:
         fail("校验失败：找不到 K2P 的 rt_channel=11")
+
+    if re.search(r'(?m)^[ \t]*\{ "rt_HT_80211KV", "0" \},', src):
+        print("[校验] rt_HT_80211KV  -> 0（K2P 分支）✓")
+    else:
+        fail("校验失败：找不到 K2P 的 rt_HT_80211KV=0")
 
     if OPEN_DEFAULT_WIFI:
         for need in ('{ "wl_auth_mode", "open" },', '{ "wl_wpa_psk", "" },',
