@@ -1,0 +1,187 @@
+name: Build K2P-NANO with AP fixes
+
+# ===== 怎么用（不用改这个文件）=====
+# 仓库页 → Actions → 左侧选 "Build K2P-NANO with AP fixes" → 右侧 Run workflow
+#   → 机型保持默认 K2P-NANO（你的 AP 实测就是这个）→ 绿色 Run workflow 按钮
+# 约 30~60 分钟（第二次起有 ccache 缓存，会快很多；期间可以关网页）
+# 编好后在该次运行页面底部 Artifacts 里下载 → 得到 .trx
+#
+# 这个固件相对原版做了三件事：
+#   1) 内置「AP 看门狗 + 可靠重启」（见 .github/patch_mtd_storage.py）
+#   2) 去掉「QoS 限速」(SQM)：包不编译、网页页面删掉、菜单项消失
+#   3) 5G 信道带宽默认值 20/40/80MHz → 20/40MHz（见 .github/patch_k2p_wifi_defaults.py）
+#      —— 与主路由 QWRT 侧的 VHT40 对齐，避免同信道无线回程(apcli0)在 80MHz 下丢包
+#
+# 说明：
+# - 这份 workflow 是照着上游自带的 .github/workflows/build.yml 改的
+#   （依赖列表、Go/Node 环境、ccache 用法保持一致，只多了上面三步），
+#   文件名故意不叫 build.yml，避免把仓库自带的 workflow 覆盖掉。
+# - 机型下拉默认 K2P-NANO —— 实测你两台 AP：/rom 版本 4.4.198.9、
+#   没装 curl / ttyd / xray / shadowsocks（这几个只有完整版 K2P 才有），
+#   所以现在跑的是 NANO 版。选错机型刷进去会出问题，别乱改。
+
+on:
+  workflow_dispatch:
+    inputs:
+      target:
+        description: '要编译的机型（你的 AP 实测是 K2P-NANO，别改）'
+        required: true
+        default: 'K2P-NANO'
+        type: choice
+        options:
+          - K2P-NANO
+          - K2P
+          - K2P-USB
+  push:
+    branches: [main]
+    paths:
+      - '.github/**'
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 350
+
+    steps:
+      - name: 1) 取源码
+        uses: actions/checkout@v4
+
+      - name: 2) 确定机型
+        run: |
+          # 手动点 Run workflow 时用你选的；靠 push 自动触发时没得选，用默认值
+          T='${{ github.event.inputs.target }}'
+          [ -n "$T" ] || T='K2P-NANO'
+          echo "TARGET=$T" >> "$GITHUB_ENV"
+          echo "本次编译机型: $T"
+
+      - name: 3) ccache（缓存编译中间产物：第二次编译会快很多）
+        uses: hendrikmuhs/ccache-action@v1.2
+        with:
+          key: ${{ github.event.inputs.target || 'K2P-NANO' }}-ap-fixes
+
+      - name: 4) Go 环境（K2P 模板里有 go 写的程序，缺了会编译失败）
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.20'
+          check-latest: true
+          cache: false
+
+      - name: 5) Node 环境（K2P 模板里有 AdGuardHome，缺了会编译失败）
+        uses: actions/setup-node@v4
+        with:
+          node-version: 18
+          check-latest: true
+
+      - name: 6) 安装编译依赖
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y unzip libtool-bin ccache curl cmake gperf gawk flex bison nano xxd \
+            fakeroot kmod cpio bc zip git python3-docutils gettext automake autopoint texinfo \
+            build-essential help2man pkg-config zlib1g-dev libgmp3-dev libmpc-dev libmpfr-dev \
+            libncurses5-dev libltdl-dev wget libc-dev-bin
+
+      - name: 7) 打补丁：把「AP 看门狗 + 可靠重启」写进固件
+        run: |
+          set -e
+          # 优先取文件名就叫 mtd_storage.sh 的那个；取不到再退回第一个命中
+          F=$(grep -rl 'func_fill()' trunk/ | grep 'mtd_storage\.sh$' | head -1)
+          [ -n "$F" ] || F=$(grep -rl 'func_fill()' trunk/ | head -1)
+          echo "目标文件: $F"
+          test -n "$F"
+          python3 .github/patch_mtd_storage.py "$F"
+
+          echo "--- 校验 1/2：函数与调用点（应为 1 个定义 + 3 个调用）---"
+          grep -n 'func_tsl_fixes' "$F"
+
+          echo "--- 校验 2/2：补丁差异（开头 40 行）---"
+          diff -u "$F.orig" "$F" | head -40 || true
+
+      - name: 8) 打补丁：K2P 的 5G 高级默认值对齐到两台 AP 的实测配置
+        run: |
+          set -e
+          # 把「两台 AP 实测在用的那套 5G 高级参数」烤进固件的 nvram 默认值表
+          # （trunk/user/shared/src/defaults.c），做到「恢复出厂即带」：
+          #   1) wl_HT_BW        2(20/40/80MHz) -> 1(20/40MHz)
+          #      K2P 的 board.h 有 BOARD_HAS_5G_11AC=1，出厂默认本来是 80MHz；
+          #      但 K2P 是 2x2 MT7615D 且 5G 要兼做同信道无线回程，
+          #      同批实测 40MHz 上行 92.4Mbps vs 80MHz 79.9~82.1Mbps。
+          #   2) wl_wme          1(开) -> 0(关)
+          #      主路由 QWRT 的驱动 profile 里 WmmCapable=0（WMM 关），
+          #      AP 侧开 WMM 会导致作为 STA 的 apcli0 关联失败（实测失联）。
+          #   3) wl_country_code 默认 -> "CN"
+          # 只影响 K2P；其它机型的这三个默认值完全不变。幂等。
+          D="trunk/user/shared/src/defaults.c"
+          test -f "$D"
+          grep -n -B2 -A4 'wl_HT_BW' "$D" || true
+          python3 .github/patch_k2p_wifi_defaults.py "$D"
+
+          echo "--- 校验 1/4：wl_HT_BW 的 K2P 分支 ---"
+          grep -n -A4 'BOARD_HAS_5G_11AC && !defined(BOARD_K2P)' "$D"
+          grep -q 'BOARD_HAS_5G_11AC && !defined(BOARD_K2P)' "$D" || { echo "!! wl_HT_BW 补丁没打上，中止"; exit 1; }
+          echo "--- 校验 2/4：K2P 的 wl_wme=0 ---"
+          grep -n -B1 -A4 '"wl_wme", "0"' "$D"
+          grep -q '"wl_wme", "0"' "$D" || { echo "!! wl_wme 没改成 0，中止"; exit 1; }
+          echo "--- 校验 3/4：K2P 的 wl_country_code=CN ---"
+          grep -n -B1 -A4 '"wl_country_code", "CN"' "$D"
+          grep -q '"wl_country_code", "CN"' "$D" || { echo "!! 国家码没钉成 CN，中止"; exit 1; }
+          echo "--- 校验 4/4：5G 默认发射功率必须保持 100（本次不动功率）---"
+          grep -q '"wl_TxPower", "100"' "$D" || { echo "!! 5G 默认功率不是 100，中止"; exit 1; }
+          # 预处理块必须成对，否则会把后面整段吃掉
+          test "$(grep -c '^#ifdef BOARD_K2P' "$D")" = "2" || { echo "!! #ifdef BOARD_K2P 不是 2 处，中止"; exit 1; }
+          rm -f "$D.orig"
+
+      - name: 9) 去掉「QoS 限速」(SQM)：包 / 网页 / 菜单一起下掉
+        run: |
+          set -e
+          CFG="trunk/configs/templates/$TARGET.config"
+          test -f "$CFG" || { echo "找不到模板 $CFG"; exit 1; }
+
+          echo "--- 改之前 ---"
+          grep -n 'INCLUDE_SQM\|INCLUDE_QOS' "$CFG" || true
+
+          # SQM = 网页里的「QoS 限速」那个功能；关掉后：
+          #   user/cflags.mk 不再定义 APP_SQM -> httpd 的 found_app_sqm() 返回 0
+          #   -> 菜单项「QoS 限速」不显示；www/Makefile 会自动删掉 Advanced_SQM.asp；
+          #   user/Makefile 里 dir_$(CONFIG_FIRMWARE_INCLUDE_SQM) 为空 -> 不编译 sqm-qos 包。
+          sed -i 's/^CONFIG_FIRMWARE_INCLUDE_SQM=.*/CONFIG_FIRMWARE_INCLUDE_SQM=n/' "$CFG"
+          # 顺带把老式 QoS 模块也确保关掉（原本就是 n）
+          sed -i 's/^CONFIG_FIRMWARE_INCLUDE_QOS=.*/CONFIG_FIRMWARE_INCLUDE_QOS=n/' "$CFG"
+
+          echo "--- 改之后 ---"
+          grep -n 'INCLUDE_SQM\|INCLUDE_QOS' "$CFG"
+          grep -q '^CONFIG_FIRMWARE_INCLUDE_SQM=n$' "$CFG" || { echo "!! SQM 没关掉，中止"; exit 1; }
+          echo "OK：这次编出来的固件不含 QoS 限速"
+
+      - name: 10) 编译
+        run: |
+          make "$TARGET" TOOLCHAIN=mipsel-linux-musl 2>&1 | tail -n 200
+
+      - name: 11) 看产物 + 改名 + 复核
+        run: |
+          if [ "$TARGET" = "K2P-NANO" ]; then
+            for image in trunk/images/*.trx ; do
+              [ -e "$image" ] || continue
+              mv "$image" "$(echo "$image" | sed 's/K2P/K2P-NANO/')"
+            done
+          fi
+          echo "--- 最终产物 ---"
+          ls -lh trunk/images/
+          md5sum trunk/images/*.trx || true
+
+          echo "--- 复核 1：QoS 限速页面应已不在固件里 ---"
+          if [ -e trunk/romfs/www/Advanced_SQM.asp ] ; then
+            echo "!! 警告：Advanced_SQM.asp 还在，说明没删干净"
+          else
+            echo "OK：固件 www 里没有 Advanced_SQM.asp"
+          fi
+          echo "--- 复核 2：看门狗脚本应已打进 storage 模板 ---"
+          grep -c 'watchdog-version: v3-generic' trunk/user/scripts/files/sbin/mtd_storage.sh || true
+          echo "--- 复核 3：5G 带宽默认值（应看到 K2P 走 20/40MHz 分支）---"
+          grep -n -A4 'BOARD_HAS_5G_11AC && !defined(BOARD_K2P)' trunk/user/shared/src/defaults.c
+
+      - name: 12) 上传固件
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.TARGET }}-firmware
+          path: trunk/images/*.trx
+          if-no-files-found: error
