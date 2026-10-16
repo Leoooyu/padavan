@@ -153,7 +153,7 @@ jobs:
           # 真机 A/B 实测：11 位纯数字串永不触发；把 atoi 只喂后 4 位时立刻按时重启。
           W="trunk/user/rc/src/watchdog.c"
           if [ ! -f "$W" ]; then
-            W="$(find trunk -type f -name watchdog.c | head -n 1)"
+            W="$(find trunk/user -type f -name watchdog.c | head -n 1)"
             echo "!! 预期路径不在，已自动定位到：$W"
           fi
           [ -n "$W" ] && [ -f "$W" ] || { echo "!! 仓库里找不到 watchdog.c，中止"; exit 1; }
@@ -221,16 +221,21 @@ jobs:
           echo "--- 复核 2：看门狗脚本应已打进 storage 模板 ---"
           grep -c 'watchdog-version: v4-generic' trunk/user/scripts/files/sbin/mtd_storage.sh || true
           echo "--- 复核 3：5G 带宽默认值（应看到 K2P 走 20/40MHz 分支）---"
-          grep -n -A4 'BOARD_HAS_5G_11AC && !defined(BOARD_K2P)' trunk/user/shared/src/defaults.c
+          grep -n -A4 'BOARD_HAS_5G_11AC && !defined(BOARD_K2P)' trunk/user/shared/src/defaults.c || true
           echo "--- 复核 4：K2P 出厂双频都是开放网络（无密码）---"
-          grep -n -B1 -A4 '"wl_wpa_psk", ""' trunk/user/shared/src/defaults.c
-          grep -n -B1 -A4 '"rt_wpa_psk", ""' trunk/user/shared/src/defaults.c
+          grep -n -B1 -A4 '"wl_wpa_psk", ""' trunk/user/shared/src/defaults.c || true
+          grep -n -B1 -A4 '"rt_wpa_psk", ""' trunk/user/shared/src/defaults.c || true
           echo "--- 复核 5：定时重启门槛已修好（不应再出现老写法）---"
-          W2="$(find trunk -type f -name watchdog.c | head -n 1)"
-          grep -n 'atoi(reboot_schedule' "$W2"
-          if grep -qE '^[[:space:]]*if \(strlen\(reboot_schedule\) == 11 && atoi\(reboot_schedule\) > 2359\)' "$W2" ; then
-            echo "!! 警告：定时重启的老写法还在，说明补丁没生效"; exit 1
-          fi
+          # GitHub 的 run 默认 bash -e：任何 grep 落空都会把整个步骤判失败。
+          # 展示用的 grep 一律 || true；只有「老写法还在」才真的 exit 1。
+          # trunk 里可能不止一个 watchdog.c（内核树也有同名文件），所以逐个遍历。
+          for W2 in $(find trunk/user -type f -name watchdog.c); do
+            echo "检查 $W2 :"
+            grep -n 'atoi(reboot_schedule' "$W2" || true
+            if grep -qE '^[[:space:]]*if \(strlen\(reboot_schedule\) == 11 && atoi\(reboot_schedule\) > 2359\)' "$W2" ; then
+              echo "!! 警告：定时重启的老写法还在（$W2），说明补丁没生效"; exit 1
+            fi
+          done
 
       - name: 12) 上传固件
         uses: actions/upload-artifact@v4
