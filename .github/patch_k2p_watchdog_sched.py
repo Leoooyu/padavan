@@ -7,7 +7,7 @@ patch_k2p_watchdog_sched.py
 
 病根（2026-10-16 在两台 AP 同款的 K2P-NANO 上 A/B 实测确认）
 --------------------------------------------------------------
-`trunk/user/rc/watchdog.c` 的 `svc_timecheck()` 里有这道门：
+`trunk/user/rc/src/watchdog.c` 的 `svc_timecheck()` 里有这道门：
 
     if (strlen(reboot_schedule) == 11 && atoi(reboot_schedule) > 2359)
 
@@ -42,7 +42,7 @@ A/B 实测证据（同一台设备、同一分钟）：
 
 用法：
     python3 .github/patch_k2p_watchdog_sched.py [watchdog.c 路径]
-    （默认 trunk/user/rc/watchdog.c）
+    （默认 trunk/user/rc/src/watchdog.c）
 """
 
 import os
@@ -50,7 +50,7 @@ import re
 import shutil
 import sys
 
-DEFAULT_PATH = os.path.join("trunk", "user", "rc", "watchdog.c")
+DEFAULT_PATH = os.path.join("trunk", "user", "rc", "src", "watchdog.c")
 
 # 是否顺带修 ss_schedule 的同款写法（默认不修，保持改动最小）
 ALSO_FIX_SS = False
