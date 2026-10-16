@@ -151,8 +151,12 @@ jobs:
           # 上游 watchdog.c 的门槛 `strlen(...)==11 && atoi(reboot_schedule) > 2359`
           # 对网页界面写出的 11 位纯数字串必然溢出 int -> 条件恒假 -> 定时重启永不触发。
           # 真机 A/B 实测：11 位纯数字串永不触发；把 atoi 只喂后 4 位时立刻按时重启。
-          W="trunk/user/rc/watchdog.c"
-          test -f "$W" || { echo "找不到 $W"; exit 1; }
+          W="trunk/user/rc/src/watchdog.c"
+          if [ ! -f "$W" ]; then
+            W="$(find trunk -type f -name watchdog.c | head -n 1)"
+            echo "!! 预期路径不在，已自动定位到：$W"
+          fi
+          [ -n "$W" ] && [ -f "$W" ] || { echo "!! 仓库里找不到 watchdog.c，中止"; exit 1; }
 
           echo "--- 改之前 ---"
           grep -n -B1 -A1 'atoi(reboot_schedule)' "$W" || true
@@ -222,8 +226,9 @@ jobs:
           grep -n -B1 -A4 '"wl_wpa_psk", ""' trunk/user/shared/src/defaults.c
           grep -n -B1 -A4 '"rt_wpa_psk", ""' trunk/user/shared/src/defaults.c
           echo "--- 复核 5：定时重启门槛已修好（不应再出现老写法）---"
-          grep -n 'atoi(reboot_schedule' trunk/user/rc/watchdog.c
-          if grep -qE '^[[:space:]]*if \(strlen\(reboot_schedule\) == 11 && atoi\(reboot_schedule\) > 2359\)' trunk/user/rc/watchdog.c ; then
+          W2="$(find trunk -type f -name watchdog.c | head -n 1)"
+          grep -n 'atoi(reboot_schedule' "$W2"
+          if grep -qE '^[[:space:]]*if \(strlen\(reboot_schedule\) == 11 && atoi\(reboot_schedule\) > 2359\)' "$W2" ; then
             echo "!! 警告：定时重启的老写法还在，说明补丁没生效"; exit 1
           fi
 
