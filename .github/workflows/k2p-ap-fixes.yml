@@ -6,15 +6,19 @@ name: Build K2P-NANO with AP fixes
 # 约 30~60 分钟（第二次起有 ccache 缓存，会快很多；期间可以关网页）
 # 编好后在该次运行页面底部 Artifacts 里下载 → 得到 .trx
 #
-# 这个固件相对原版做了三件事：
+# 这个固件相对原版做了四件事：
 #   1) 内置「AP 看门狗 + 可靠重启」（见 .github/patch_mtd_storage.py）
 #   2) 去掉「QoS 限速」(SQM)：包不编译、网页页面删掉、菜单项消失
 #   3) 5G 信道带宽默认值 20/40/80MHz → 20/40MHz（见 .github/patch_k2p_wifi_defaults.py）
 #      —— 与主路由 QWRT 侧的 VHT40 对齐，避免同信道无线回程(apcli0)在 80MHz 下丢包
+#   4) 修好「自带定时重启」（见 .github/patch_k2p_watchdog_sched.py）
+#      原版 watchdog.c 的门槛 `atoi(reboot_schedule) > 2359` 对 11 位纯数字串必然溢出
+#      → 定时重启永不触发（真机 A/B 实测确认）
+#   另：K2P 出厂 2.4G/5G 改成**开放网络（无密码）**，删掉预置口令 1234567890
 #
 # 说明：
 # - 这份 workflow 是照着上游自带的 .github/workflows/build.yml 改的
-#   （依赖列表、Go/Node 环境、ccache 用法保持一致，只多了上面三步），
+#   （依赖列表、Go/Node 环境、ccache 用法保持一致，只多了上面这些步骤），
 #   文件名故意不叫 build.yml，避免把仓库自带的 workflow 覆盖掉。
 # - 机型下拉默认 K2P-NANO —— 实测你两台 AP：/rom 版本 4.4.198.9、
 #   没装 curl / ttyd / xray / shadowsocks（这几个只有完整版 K2P 才有），
@@ -96,7 +100,7 @@ jobs:
           echo "--- 校验 2/2：补丁差异（开头 40 行）---"
           diff -u "$F.orig" "$F" | head -40 || true
 
-      - name: 8) 打补丁：K2P 的 5G 高级默认值对齐到两台 AP 的实测配置
+      - name: 8) 打补丁：K2P 的 5G 高级默认值对齐实测配置 + 出厂开放网络
         run: |
           set -e
           # 把「两台 AP 实测在用的那套 5G 高级参数」烤进固件的 nvram 默认值表
@@ -109,26 +113,62 @@ jobs:
           #      主路由 QWRT 的驱动 profile 里 WmmCapable=0（WMM 关），
           #      AP 侧开 WMM 会导致作为 STA 的 apcli0 关联失败（实测失联）。
           #   3) wl_country_code 默认 -> "CN"
-          # 只影响 K2P；其它机型的这三个默认值完全不变。幂等。
+          #   4) wl_auth_mode/rt_auth_mode "psk" -> "open"，wl_wpa_psk/rt_wpa_psk -> ""
+          #      → K2P 出厂 2.4G/5G 即开放网络（无密码），删掉预置口令 1234567890
+          # 只影响 K2P；其它机型的这些默认值完全不变。幂等。
           D="trunk/user/shared/src/defaults.c"
           test -f "$D"
           grep -n -B2 -A4 'wl_HT_BW' "$D" || true
           python3 .github/patch_k2p_wifi_defaults.py "$D"
 
-          echo "--- 校验 1/4：wl_HT_BW 的 K2P 分支 ---"
+          echo "--- 校验 1/8：wl_HT_BW 的 K2P 分支 ---"
           grep -n -A4 'BOARD_HAS_5G_11AC && !defined(BOARD_K2P)' "$D"
           grep -q 'BOARD_HAS_5G_11AC && !defined(BOARD_K2P)' "$D" || { echo "!! wl_HT_BW 补丁没打上，中止"; exit 1; }
-          echo "--- 校验 2/4：K2P 的 wl_wme=0 ---"
+          echo "--- 校验 2/8：K2P 的 wl_wme=0 ---"
           grep -n -B1 -A4 '"wl_wme", "0"' "$D"
           grep -q '"wl_wme", "0"' "$D" || { echo "!! wl_wme 没改成 0，中止"; exit 1; }
-          echo "--- 校验 3/4：K2P 的 wl_country_code=CN ---"
+          echo "--- 校验 3/8：K2P 的 wl_country_code=CN ---"
           grep -n -B1 -A4 '"wl_country_code", "CN"' "$D"
           grep -q '"wl_country_code", "CN"' "$D" || { echo "!! 国家码没钉成 CN，中止"; exit 1; }
-          echo "--- 校验 4/4：5G 默认发射功率必须保持 100（本次不动功率）---"
+          echo "--- 校验 4/8：5G 默认发射功率必须保持 100（本次不动功率）---"
           grep -q '"wl_TxPower", "100"' "$D" || { echo "!! 5G 默认功率不是 100，中止"; exit 1; }
-          # 预处理块必须成对，否则会把后面整段吃掉
-          test "$(grep -c '^#ifdef BOARD_K2P' "$D")" = "2" || { echo "!! #ifdef BOARD_K2P 不是 2 处，中止"; exit 1; }
+          echo "--- 校验 5/8：K2P 出厂 5G 不加密 ---"
+          grep -q '{ "wl_auth_mode", "open" },' "$D" || { echo "!! 5G auth_mode 没改成 open，中止"; exit 1; }
+          grep -q '{ "wl_wpa_psk", "" },' "$D" || { echo "!! 5G 预置口令没清空，中止"; exit 1; }
+          echo "--- 校验 6/8：K2P 出厂 2.4G 不加密 ---"
+          grep -q '{ "rt_auth_mode", "open" },' "$D" || { echo "!! 2.4G auth_mode 没改成 open，中止"; exit 1; }
+          grep -q '{ "rt_wpa_psk", "" },' "$D" || { echo "!! 2.4G 预置口令没清空，中止"; exit 1; }
+          echo "--- 校验 7/8：原厂 psk 宏只应剩在非 K2P 分支（各 1 处）---"
+          test "$(grep -c 'DEF_WLAN_5G_PSK' "$D")" = "1" || { echo "!! DEF_WLAN_5G_PSK 不是 1 处，中止"; exit 1; }
+          test "$(grep -c 'DEF_WLAN_2G_PSK' "$D")" = "1" || { echo "!! DEF_WLAN_2G_PSK 不是 1 处，中止"; exit 1; }
+          echo "--- 校验 8/8：预处理块必须成对，否则会把后面整段吃掉 ---"
+          test "$(grep -c '^#ifdef BOARD_K2P' "$D")" = "6" || { echo "!! #ifdef BOARD_K2P 不是 6 处，中止"; exit 1; }
           rm -f "$D.orig"
+
+      - name: 8b) 打补丁：修好「自带定时重启」永不触发的门槛
+        run: |
+          set -e
+          # 上游 watchdog.c 的门槛 `strlen(...)==11 && atoi(reboot_schedule) > 2359`
+          # 对网页界面写出的 11 位纯数字串必然溢出 int -> 条件恒假 -> 定时重启永不触发。
+          # 真机 A/B 实测：11 位纯数字串永不触发；把 atoi 只喂后 4 位时立刻按时重启。
+          W="trunk/user/rc/watchdog.c"
+          test -f "$W" || { echo "找不到 $W"; exit 1; }
+
+          echo "--- 改之前 ---"
+          grep -n -B1 -A1 'atoi(reboot_schedule)' "$W" || true
+          python3 .github/patch_k2p_watchdog_sched.py "$W"
+
+          echo "--- 校验 1/3：新的 HHMM 校验在位 ---"
+          grep -q 'atoi(reboot_schedule + 7) <= 2359' "$W" \
+            || { echo "!! 定时重启门槛没修好，中止"; exit 1; }
+          echo "--- 校验 2/3：老的溢出写法必须消失（按整行匹配，避免误伤注释）---"
+          if grep -qE '^[[:space:]]*if \(strlen\(reboot_schedule\) == 11 && atoi\(reboot_schedule\) > 2359\)' "$W" ; then
+            echo "!! 老的错误条件还在，中止"; exit 1
+          fi
+          echo "--- 校验 3/3：nvram 键名与结构未被我改动 ---"
+          grep -q 'nvram_match("reboot_schedule_enable", "1")' "$W" || { echo "!! 结构被破坏，中止"; exit 1; }
+          grep -q 'nvram_match("ntp_ready", "1")' "$W" || { echo "!! 结构被破坏，中止"; exit 1; }
+          echo "OK：定时重启的门槛已修好（改前改后只差这一个比较表达式）"
 
       - name: 9) 去掉「QoS 限速」(SQM)：包 / 网页 / 菜单一起下掉
         run: |
@@ -175,9 +215,17 @@ jobs:
             echo "OK：固件 www 里没有 Advanced_SQM.asp"
           fi
           echo "--- 复核 2：看门狗脚本应已打进 storage 模板 ---"
-          grep -c 'watchdog-version: v3-generic' trunk/user/scripts/files/sbin/mtd_storage.sh || true
+          grep -c 'watchdog-version: v4-generic' trunk/user/scripts/files/sbin/mtd_storage.sh || true
           echo "--- 复核 3：5G 带宽默认值（应看到 K2P 走 20/40MHz 分支）---"
           grep -n -A4 'BOARD_HAS_5G_11AC && !defined(BOARD_K2P)' trunk/user/shared/src/defaults.c
+          echo "--- 复核 4：K2P 出厂双频都是开放网络（无密码）---"
+          grep -n -B1 -A4 '"wl_wpa_psk", ""' trunk/user/shared/src/defaults.c
+          grep -n -B1 -A4 '"rt_wpa_psk", ""' trunk/user/shared/src/defaults.c
+          echo "--- 复核 5：定时重启门槛已修好（不应再出现老写法）---"
+          grep -n 'atoi(reboot_schedule' trunk/user/rc/watchdog.c
+          if grep -qE '^[[:space:]]*if \(strlen\(reboot_schedule\) == 11 && atoi\(reboot_schedule\) > 2359\)' trunk/user/rc/watchdog.c ; then
+            echo "!! 警告：定时重启的老写法还在，说明补丁没生效"; exit 1
+          fi
 
       - name: 12) 上传固件
         uses: actions/upload-artifact@v4
