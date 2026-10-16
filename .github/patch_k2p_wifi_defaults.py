@@ -26,6 +26,20 @@ patch_k2p_wifi_defaults.py
    这里给 K2P 钉死 CN，保证恢复出厂也是 CN。
    不想要这一条就把下面 PIN_COUNTRY_CN 改成 False。
 
+4) `wl_auth_mode` / `rt_auth_mode` : "psk" -> "open"（两频段都默认不加密）
+5) `wl_wpa_psk` / `rt_wpa_psk`   : 出厂预置口令 -> 空串
+   出厂默认 WPA 口令是 `DEF_WLAN_5G_PSK` / `DEF_WLAN_2G_PSK`（= "1234567890"，
+   一个人尽皆知的弱口令）。这两条把它删掉，让 2.4G / 5G **出厂即开放网络**（无密码）。
+   做法照抄 Padavan 自己的访客网络默认值（`wl_guest_auth_mode="open"` +
+   `wl_guest_wpa_psk=""`），是这套固件里已有、能正常工作的组合。
+
+   ⚠️ 只影响「恢复出厂 / 不保留配置刷机」之后的初始状态：
+      * 「保留配置」刷机时 nvram 不动，手上已设好密码的机器**完全不受影响**；
+      * 也**不影响**无线回程（apcli0）—— 上级 SSID/口令走 `wl_sta_ssid` /
+        `wl_sta_wpa_psk`，那是另一组键。
+   ⚠️ 出厂开放意味着「恢复出厂后被别人蹭网」的风险自负。不想要就把
+      OPEN_DEFAULT_WIFI 改成 False（恢复成原厂的 psk + 预置口令）。
+
 **没有改的项**（逐条比对过，Padavan 出厂默认已经与 AP 实测值一致）：
   TxPower=100、wl_txbf=1、wl_ldpc=2、wl_mumimo=0、wl_HT_BAWinSize=256、wl_HT_AMSDU=1、
   wl_HT_AutoBA=1、wl_PktAggregate=1、wl_rts=2347、wl_frag=2346、wl_bcn=100、wl_dtim=1、
@@ -49,6 +63,9 @@ DEFAULT_PATH = os.path.join("trunk", "user", "shared", "src", "defaults.c")
 
 # 钉死国家码 CN（不想钉就改成 False）
 PIN_COUNTRY_CN = True
+
+# 出厂 2.4G / 5G 默认开放（删掉预置口令 "1234567890"）；不想开放就改成 False
+OPEN_DEFAULT_WIFI = True
 
 # --- 1) 5G 信道带宽 ---
 OLD_COND = "#if BOARD_HAS_5G_11AC"
@@ -81,9 +98,33 @@ def wrap_k2p(src, key, old_decl, new_decl, new_comment, old_comment):
         "%s%s%s%s\n"
         "#else\n"
         "%s%s%s%s\n"
-        "#endif\n"
+        "#endif"
     ) % (indent, new_decl, m.group(2), new_comment,
          indent, old_decl, m.group(2), old_comment)
+    out = src[:m.start()] + new_text + src[m.end():]
+    return out, "已改：%s -> K2P 用 %s" % (old_decl, new_decl)
+
+
+def wrap_k2p_any(src, old_decl, new_decl, new_tail, label):
+    """同上，但**允许行尾没有注释**（2.4G 那两行就是没有）。
+
+    行尾若有注释会原样保留在 #else 分支上；new_tail 是新分支自己的行尾注释。
+    返回 (新文本, 状态字符串)。找不到行 fail。
+    """
+    pat = re.compile(r"(?m)^([ \t]*)" + re.escape(old_decl) + r"([ \t]*(?:/\*[^\n]*\*/)?)[ \t]*$")
+    hits = list(pat.finditer(src))
+    if len(hits) != 1:
+        fail("%s：期望 `%s` 恰好命中 1 行、实际 %d 行 —— 上游结构可能已变，中止"
+             % (label, old_decl, len(hits)))
+    m = hits[0]
+    indent, tail = m.group(1), m.group(2)
+    new_text = (
+        "#ifdef BOARD_K2P\n"
+        "%s%s%s\n"
+        "#else\n"
+        "%s%s%s\n"
+        "#endif"
+    ) % (indent, new_decl, new_tail, indent, old_decl, tail)
     out = src[:m.start()] + new_text + src[m.end():]
     return out, "已改：%s -> K2P 用 %s" % (old_decl, new_decl)
 
@@ -161,6 +202,36 @@ def main():
     else:
         print("[跳过] 按配置不钉国家码")
 
+    # ---------- 4) 5) 出厂 2.4G / 5G 删掉预置口令（默认开放）----------
+    OPEN_JOBS = [
+        ('{ "wl_auth_mode", "psk" },',
+         '{ "wl_auth_mode", "open" },',
+         "\t\t/* K2P：出厂默认不加密 */",
+         "wl_auth_mode(5G)"),
+        ('{ "wl_wpa_psk", DEF_WLAN_5G_PSK },',
+         '{ "wl_wpa_psk", "" },',
+         "\t\t\t/* K2P：出厂默认无密码 */",
+         "wl_wpa_psk(5G)"),
+        ('{ "rt_auth_mode", "psk" },',
+         '{ "rt_auth_mode", "open" },',
+         "\t\t/* K2P：出厂默认不加密 */",
+         "rt_auth_mode(2.4G)"),
+        ('{ "rt_wpa_psk", DEF_WLAN_2G_PSK },',
+         '{ "rt_wpa_psk", "" },',
+         "\t\t\t/* K2P：出厂默认无密码 */",
+         "rt_wpa_psk(2.4G)"),
+    ]
+    if OPEN_DEFAULT_WIFI:
+        for old_decl, new_decl, new_tail, label in OPEN_JOBS:
+            if new_decl in src:
+                print("[跳过] %s 已经是 %s" % (label, new_decl))
+                continue
+            src, msg = wrap_k2p_any(src, old_decl, new_decl, new_tail, label)
+            print("[%s] %s" % (label, msg))
+            changed.append(label)
+    else:
+        print("[跳过] 按配置保留出厂预置口令")
+
     # ---------- 写回 ----------
     if src == orig:
         print("[无变化] 文件已是最新")
@@ -190,6 +261,19 @@ def main():
     if PIN_COUNTRY_CN and not re.search(r'(?m)^[ \t]*\{ "wl_country_code", "CN" \},', src):
         fail("校验失败：找不到 K2P 的 wl_country_code=CN")
 
+    if OPEN_DEFAULT_WIFI:
+        for need in ('{ "wl_auth_mode", "open" },', '{ "wl_wpa_psk", "" },',
+                     '{ "rt_auth_mode", "open" },', '{ "rt_wpa_psk", "" },'):
+            if not re.search(r'(?m)^[ \t]*' + re.escape(need), src):
+                fail("校验失败：找不到 K2P 的 %s" % need)
+        print("[校验] wl/rt 双频段 auth_mode=open + 预置口令已清空 ✓")
+        # 原始 psk 宏只应出现在 #else 分支里（即非 K2P）
+        for macro in ("DEF_WLAN_5G_PSK", "DEF_WLAN_2G_PSK"):
+            if src.count(macro) != 1:
+                fail("校验失败：%s 出现 %d 次（应恰好 1 次，只在 #else 分支）"
+                     % (macro, src.count(macro)))
+        print("[校验] 原厂 psk 宏仍完好保留在非 K2P 分支 ✓")
+
     # 每个 `#ifdef BOARD_K2P` 必须紧跟 `#else` + `#endif`（三行结构，别漏 #endif 把整段吃掉）
     lines = src.split("\n")
     for i, l in enumerate(lines):
@@ -201,7 +285,9 @@ def main():
     print("[校验] 5G 默认发射功率仍为 100（未改动）✓")
 
     print()
-    print("OK：K2P 出厂 5G 默认 = %s" % (", ".join(changed) if changed else "（本次无变化）"))
+    print("OK：K2P 出厂默认 = %s" % (", ".join(changed) if changed else "（本次无变化）"))
+    if OPEN_DEFAULT_WIFI:
+        print("OK：K2P 出厂 2.4G/5G = 开放网络（无密码）；其它机型仍是 psk + 1234567890")
     print("OK：其它 11AC 机型仍为 wl_HT_BW=2 / wl_wme=1，完全不受影响")
     print()
     print("提示：这只决定『没有该 nvram 项时写入的默认值』；")
