@@ -183,7 +183,15 @@ case "$1" in
 	--gw)	get_gw ; exit 0 ;;
 	--once)	check_once ; echo "checked once (gw=$(get_gw))" ; exit 0 ;;
 	--reboot)	do_reboot ; exit 0 ;;
-	*)	while true ; do
+	*)
+		# 只在 AP / 中继模式（sw_mode=2/3）跑主循环。
+		# 路由器 / 网关模式（sw_mode=1/4）的默认路由指向 WAN，
+		# WAN 抖动会被误判成「上游失联」并重启整机 —— 必须跳过。
+		case "$(nvram get sw_mode)" in
+			2|3) ;;
+			*)	log "sw_mode=$(nvram get sw_mode) (router/gateway) -> watchdog disabled" ; exit 0 ;;
+		esac
+		while true ; do
 			check_once
 			sleep "$INTERVAL"
 		done ;;
@@ -250,10 +258,16 @@ TSLEOF
 # Padavan 没有 setsid：用 pid 文件 + start-stop-daemon 脱离会话
 # （实测直接 `( ... ) &` 起的后台任务会随 SSH 会话被回收）。
 # 守卫用 kill -0 探测 pid —— busybox 的 `ps w` 会截断过长命令行，grep 守卫会误判。
+# 只在 AP / 中继模式（sw_mode=2/3）启动；路由 / 网关（1/4）不启动 ——
+# 主路由模式默认路由指向 WAN，看门狗会把 WAN 抖动误判成上游失联并重启整机。
 PIDF=/var/run/ap_watchdog.pid
-if [ ! -s "$PIDF" ] || ! kill -0 "$(cat "$PIDF" 2>/dev/null)" 2>/dev/null ; then
-	start-stop-daemon -S -b -m -p "$PIDF" -x /bin/sh -- -c '/etc/storage/ap_watchdog.sh'
-fi
+case "$(nvram get sw_mode)" in
+	2|3)
+		if [ ! -s "$PIDF" ] || ! kill -0 "$(cat "$PIDF" 2>/dev/null)" 2>/dev/null ; then
+			start-stop-daemon -S -b -m -p "$PIDF" -x /bin/sh -- -c '/etc/storage/ap_watchdog.sh'
+		fi
+		;;
+esac
 TSLEOF
 	fi
 	# ---- 关机兜底（v2 加固）----
@@ -337,9 +351,14 @@ TSLEOF
 		chmod 755 "$SH"
 	fi
 	# 立刻起一次（不等下次重启）：pid 文件 + start-stop-daemon（本机无 setsid，& 会随会话被回收）
-	if [ ! -s "/var/run/ap_watchdog.pid" ] || ! kill -0 "$(cat /var/run/ap_watchdog.pid 2>/dev/null)" 2>/dev/null ; then
-		start-stop-daemon -S -b -m -p "/var/run/ap_watchdog.pid" -x /bin/sh -- -c '/etc/storage/ap_watchdog.sh'
-	fi
+	# 只在 AP / 中继模式（sw_mode=2/3）启动；路由 / 网关（1/4）不启动（见钩子处说明）
+	case "$(nvram get sw_mode)" in
+		2|3)
+			if [ ! -s "/var/run/ap_watchdog.pid" ] || ! kill -0 "$(cat /var/run/ap_watchdog.pid 2>/dev/null)" 2>/dev/null ; then
+				start-stop-daemon -S -b -m -p "/var/run/ap_watchdog.pid" -x /bin/sh -- -c '/etc/storage/ap_watchdog.sh'
+			fi
+			;;
+	esac
 }
 # ===== end of tsl baked-in fixes =====
 '''
