@@ -258,16 +258,12 @@ TSLEOF
 # Padavan 没有 setsid：用 pid 文件 + start-stop-daemon 脱离会话
 # （实测直接 `( ... ) &` 起的后台任务会随 SSH 会话被回收）。
 # 守卫用 kill -0 探测 pid —— busybox 的 `ps w` 会截断过长命令行，grep 守卫会误判。
-# 只在 AP / 中继模式（sw_mode=2/3）启动；路由 / 网关（1/4）不启动 ——
-# 主路由模式默认路由指向 WAN，看门狗会把 WAN 抖动误判成上游失联并重启整机。
+# 模式门控不在这里做：交给 ap_watchdog.sh 自己判断（路由/网关模式会立即 exit 0），
+# 避免在启动早期调用 nvram 导致死锁。
 PIDF=/var/run/ap_watchdog.pid
-case "$(nvram get sw_mode)" in
-	2|3)
-		if [ ! -s "$PIDF" ] || ! kill -0 "$(cat "$PIDF" 2>/dev/null)" 2>/dev/null ; then
-			start-stop-daemon -S -b -m -p "$PIDF" -x /bin/sh -- -c '/etc/storage/ap_watchdog.sh'
-		fi
-		;;
-esac
+if [ ! -s "$PIDF" ] || ! kill -0 "$(cat "$PIDF" 2>/dev/null)" 2>/dev/null ; then
+	start-stop-daemon -S -b -m -p "$PIDF" -x /bin/sh -- -c '/etc/storage/ap_watchdog.sh'
+fi
 TSLEOF
 	fi
 	# ---- 关机兜底（v2 加固）----
@@ -351,14 +347,12 @@ TSLEOF
 		chmod 755 "$SH"
 	fi
 	# 立刻起一次（不等下次重启）：pid 文件 + start-stop-daemon（本机无 setsid，& 会随会话被回收）
-	# 只在 AP / 中继模式（sw_mode=2/3）启动；路由 / 网关（1/4）不启动（见钩子处说明）
-	case "$(nvram get sw_mode)" in
-		2|3)
-			if [ ! -s "/var/run/ap_watchdog.pid" ] || ! kill -0 "$(cat /var/run/ap_watchdog.pid 2>/dev/null)" 2>/dev/null ; then
-				start-stop-daemon -S -b -m -p "/var/run/ap_watchdog.pid" -x /bin/sh -- -c '/etc/storage/ap_watchdog.sh'
-			fi
-			;;
-	esac
+	# ⚠️ 这里绝对不能调用 nvram：本函数挂在 fill)/load) 分支，fill 阶段 nvram 尚未就绪，
+	#    `nvram get` 会死锁、导致整机启动卡死（实机踩过）。
+	#    模式门控交给 ap_watchdog.sh 自己判断（运行时 nvram 可用，路由/网关模式会立即 exit 0）。
+	if [ ! -s "/var/run/ap_watchdog.pid" ] || ! kill -0 "$(cat /var/run/ap_watchdog.pid 2>/dev/null)" 2>/dev/null ; then
+		start-stop-daemon -S -b -m -p "/var/run/ap_watchdog.pid" -x /bin/sh -- -c '/etc/storage/ap_watchdog.sh'
+	fi
 }
 # ===== end of tsl baked-in fixes =====
 '''
