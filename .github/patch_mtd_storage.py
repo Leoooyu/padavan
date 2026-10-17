@@ -286,7 +286,7 @@ TSLEOF
 TSLEOF
 		chmod 755 "$SH"
 	fi
-	if ! grep -q "sysrq-fallback: v2" "$SH" ; then
+	if ! grep -q "sysrq-fallback: v3" "$SH" ; then
 		# 先摘掉历史版本（v1/v2/更早的三秒版都可能残留），再重写。
 		# 判据**只用 ASCII**：先找含 `sysrq-trigger` 的那行，向上回溯到最近的 `if` 行
 		# 及其紧邻的注释行 = 块首；向下找第一个独立的 `fi` 行 = 块尾（v2 还要吃掉
@@ -322,9 +322,14 @@ TSLEOF
 			&& [ -s "/tmp/_sh_new.$$" ] && cat "/tmp/_sh_new.$$" > "$SH" && rm -f "/tmp/_sh_new.$$"
 		cat >> "$SH" <<'TSLEOF'
 
-# >>> sysrq-fallback: v2 >>>
+# >>> sysrq-fallback: v3 >>>
 # reboot 兜底（由固件/脚本安装）：正常关机优先，卡住 6 秒后用内核 sysrq 强制重启。
 # 只对「重启」动作生效（$1=0），停机和关电不会误触发。
+#
+# v3 关键修复：网页升级（rc.c 的 flash_firmware）也会以 $1=0 调用本脚本，
+#   但随后 mtd_write 还要写整个固件（30~60 秒）。若 6 秒兜底此时触发 sysrq-b，
+#   会打断写入、把固件写坏 -> 启动失败 -> 落 Breed（实机踩过：AP1 反复蓝灯闪）。
+#   所以检测到「待刷固件」（httpd 上传到 /tmp/linux.trx，>1MB）就跳过兜底。
 #
 # 为什么必须 trap：init 跑完关机脚本后会执行 kill(-1, SIGTERM) 广播 SIGTERM，
 # 不加 trap 的话这个后台兜底会被一起杀掉、等于没装（真机实测：无 trap 的 subshell
@@ -332,15 +337,19 @@ TSLEOF
 # 为什么用时间戳：kill(-1) 会把 sleep 子进程一起收掉，裸 sleep 会立刻返回、
 # 导致兜底提前触发；改成"等一个绝对时刻"，无论中途被打断几次都保证等够 6 秒。
 if [ "$1" = "0" ] ; then
-	sync
-	(
-		trap '' TERM INT HUP
-		_end=$(( $(date +%s) + 6 ))
-		while [ "$(date +%s)" -lt "$_end" ] ; do sleep 1 2>/dev/null ; done
-		echo 1 > /proc/sys/kernel/sysrq
-		echo s > /proc/sysrq-trigger
-		echo b > /proc/sysrq-trigger
-	) &
+	_sz=0
+	[ -f /tmp/linux.trx ] && _sz=$(wc -c < /tmp/linux.trx 2>/dev/null)
+	[ "${_sz:-0}" -gt 1000000 ] || {
+		sync
+		(
+			trap '' TERM INT HUP
+			_end=$(( $(date +%s) + 6 ))
+			while [ "$(date +%s)" -lt "$_end" ] ; do sleep 1 2>/dev/null ; done
+			echo 1 > /proc/sys/kernel/sysrq
+			echo s > /proc/sysrq-trigger
+			echo b > /proc/sysrq-trigger
+		) &
+	}
 fi
 # <<< sysrq-fallback <<<
 TSLEOF
