@@ -119,38 +119,41 @@ jobs:
           grep -n -B2 -A4 'wl_HT_BW' "$D" || true
           python3 .github/patch_k2p_wifi_defaults.py "$D"
 
-          echo "--- 校验 1/12：wl_HT_BW 的 K2P 分支 ---"
+          echo "--- 校验 1/13：wl_HT_BW 的 K2P 分支 ---"
           grep -n -A4 'BOARD_HAS_5G_11AC && !defined(BOARD_K2P)' "$D"
           grep -q 'BOARD_HAS_5G_11AC && !defined(BOARD_K2P)' "$D" || { echo "!! wl_HT_BW 补丁没打上，中止"; exit 1; }
-          echo "--- 校验 2/12：K2P 的 wl_wme=0 ---"
+          echo "--- 校验 2/13：K2P 的 wl_wme=0 ---"
           grep -n -B1 -A4 '"wl_wme", "0"' "$D"
           grep -q '"wl_wme", "0"' "$D" || { echo "!! wl_wme 没改成 0，中止"; exit 1; }
-          echo "--- 校验 3/12：K2P 的 wl_country_code=CN ---"
+          echo "--- 校验 3/13：K2P 的 wl_country_code=CN ---"
           grep -q '"wl_country_code", "CN"' "$D" || { echo "!! 5G 国家码没钉成 CN，中止"; exit 1; }
-          echo "--- 校验 4/12：K2P 的 rt_wme=0（2.4G WMM 对齐 QWRT）---"
+          echo "--- 校验 4/13：K2P 的 rt_wme=0（2.4G WMM 对齐 QWRT）---"
           grep -n -B1 -A2 '"rt_wme", "0"' "$D"
           grep -q '"rt_wme", "0"' "$D" || { echo "!! rt_wme 没改成 0，中止"; exit 1; }
-          echo "--- 校验 5/12：K2P 的 rt_channel=11（2.4G 信道默认钉 11）---"
+          echo "--- 校验 5/13：K2P 的 rt_channel=11（2.4G 信道默认钉 11）---"
           grep -n -B1 -A2 '"rt_channel", "11"' "$D"
           grep -q '"rt_channel", "11"' "$D" || { echo "!! rt_channel 没钉成 11，中止"; exit 1; }
-          echo "--- 校验 6/12：K2P 的 rt_HT_80211KV=0（2.4G KV 关，对齐 QWRT）---"
+          echo "--- 校验 6/13：K2P 的 rt_HT_80211KV=0（2.4G KV 关，对齐 QWRT）---"
           grep -n -B1 -A2 '"rt_HT_80211KV", "0"' "$D"
           grep -q '"rt_HT_80211KV", "0"' "$D" || { echo "!! rt_HT_80211KV 没改成 0，中止"; exit 1; }
-          echo "--- 校验 7/12：K2P 的 rt_country_code=CN ---"
+          echo "--- 校验 7/13：K2P 的 rt_country_code=CN ---"
           grep -q '"rt_country_code", "CN"' "$D" || { echo "!! 2.4G 国家码没钉成 CN，中止"; exit 1; }
-          echo "--- 校验 8/12：5G 默认发射功率必须保持 100（本次不动功率）---"
+          echo "--- 校验 8/13：5G 默认发射功率必须保持 100（本次不动功率）---"
           grep -q '"wl_TxPower", "100"' "$D" || { echo "!! 5G 默认功率不是 100，中止"; exit 1; }
-          echo "--- 校验 9/12：K2P 出厂 5G 不加密 ---"
+          echo "--- 校验 9/13：K2P 出厂 5G 不加密 ---"
           grep -q '{ "wl_auth_mode", "open" },' "$D" || { echo "!! 5G auth_mode 没改成 open，中止"; exit 1; }
           grep -q '{ "wl_wpa_psk", "" },' "$D" || { echo "!! 5G 预置口令没清空，中止"; exit 1; }
-          echo "--- 校验 10/12：K2P 出厂 2.4G 不加密 ---"
+          echo "--- 校验 10/13：K2P 出厂 2.4G 不加密 ---"
           grep -q '{ "rt_auth_mode", "open" },' "$D" || { echo "!! 2.4G auth_mode 没改成 open，中止"; exit 1; }
           grep -q '{ "rt_wpa_psk", "" },' "$D" || { echo "!! 2.4G 预置口令没清空，中止"; exit 1; }
-          echo "--- 校验 11/12：原厂 psk 宏只应剩在非 K2P 分支（各 1 处）---"
+          echo "--- 校验 11/13：原厂 psk 宏只应剩在非 K2P 分支（各 1 处）---"
           test "$(grep -c 'DEF_WLAN_5G_PSK' "$D")" = "1" || { echo "!! DEF_WLAN_5G_PSK 不是 1 处，中止"; exit 1; }
           test "$(grep -c 'DEF_WLAN_2G_PSK' "$D")" = "1" || { echo "!! DEF_WLAN_2G_PSK 不是 1 处，中止"; exit 1; }
-          echo "--- 校验 12/12：预处理块必须成对，否则会把后面整段吃掉 ---"
-          test "$(grep -c '^#ifdef BOARD_K2P' "$D")" = "10" || { echo "!! #ifdef BOARD_K2P 不是 10 处（应为 6 旧 + 4 新），中止"; exit 1; }
+          echo "--- 校验 12/13：K2P 的 wl_channel=149（5G 默认信道钉 149）---"
+          grep -n -B1 -A2 '"wl_channel", "149"' "$D"
+          grep -q '"wl_channel", "149"' "$D" || { echo "!! 5G 默认信道没钉成 149，中止"; exit 1; }
+          echo "--- 校验 13/13：预处理块必须成对，否则会把后面整段吃掉 ---"
+          test "$(grep -c '^#ifdef BOARD_K2P' "$D")" = "11" || { echo "!! #ifdef BOARD_K2P 不是 11 处（应为 6 旧 + 5 新），中止"; exit 1; }
           rm -f "$D.orig"
 
       - name: 8b) 打补丁：修好「自带定时重启」永不触发的门槛
