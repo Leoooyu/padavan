@@ -51,6 +51,12 @@ patch_k2p_wifi_defaults.py
    2.4G 只做回程、不服务客户端，KV 开关本无收益，且与上游对齐避免异常。
    注意只改 2.4G 的 rt_HT_80211KV；5G 的 wl_HT_80211KV 保持 1（5G 要 K/V 漫游）。
 
+10) `wl_channel` : 0(auto) -> 149   【v5 新增：5G 信道默认钉 149】
+   与 QWRT 主路由 rax 的 ch149 严格对齐。出厂 auto 会让 AP 开机时自行扫描选信道，
+   一旦选到与主路由不同的信道，回程 apcli0 要重新扫描、客户端漫游也会掉一跳。
+   钉死 149 后开机即在主路由信道上，回程关联更快、链路更稳。
+   ⚠️ 5.8G 频段（149~165）在国内是开放频段，27dBm 功率不受限制；且 5.8G 比 5.2G 更安静。
+
    ⚠️ 只影响「恢复出厂 / 不保留配置刷机」之后的初始状态：
       * 「保留配置」刷机时 nvram 不动，手上已设好密码的机器**完全不受影响**；
       * 也**不影响**无线回程（apcli0）—— 上级 SSID/口令走 `wl_sta_ssid` /
@@ -279,6 +285,21 @@ def main():
         print("[%s]" % msg)
         changed.append("rt_HT_80211KV=0")
 
+    # ---------- 3f) wl_channel (5G) ----------
+    if re.search(r'(?m)^[ \t]*\{ "wl_channel", "149" \},', src):
+        print("[跳过] wl_channel 已经是 149")
+    else:
+        src, msg = wrap_k2p(
+            src,
+            "wl_channel",
+            '{ "wl_channel", "0" },',
+            '{ "wl_channel", "149" },',
+            "\t\t\t/* Channel — K2P：5G 默认钉 149（对齐 QWRT 主路由） */",
+            "\t\t\t/* Channel number */",
+        )
+        print("[%s]" % msg)
+        changed.append("wl_channel=149")
+
     # ---------- 4) 5) 出厂 2.4G / 5G 删掉预置口令（默认开放）----------
     OPEN_JOBS = [
         ('{ "wl_auth_mode", "psk" },',
@@ -355,6 +376,11 @@ def main():
         print("[校验] rt_HT_80211KV  -> 0（K2P 分支）✓")
     else:
         fail("校验失败：找不到 K2P 的 rt_HT_80211KV=0")
+
+    if re.search(r'(?m)^[ \t]*\{ "wl_channel", "149" \},', src):
+        print("[校验] wl_channel  -> 149（K2P 分支）✓")
+    else:
+        fail("校验失败：找不到 K2P 的 wl_channel=149")
 
     if OPEN_DEFAULT_WIFI:
         for need in ('{ "wl_auth_mode", "open" },', '{ "wl_wpa_psk", "" },',
