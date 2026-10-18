@@ -7,8 +7,12 @@
   1) 定义 func_tsl_fixes()：
      - 写入 /etc/storage/ap_watchdog.sh（**通用版**看门狗：探测目标 = 本机实际默认网关，
        默认每 5 分钟一次，一次不通即重启；带 MIN_UPTIME 护栏防打转）
-       * 脚本头带 `watchdog-version: v4-generic` 标记，旧版会自动升级
+       * 脚本头带 `watchdog-version: v5-generic` 标记，旧版会自动升级
        * 重启逻辑移植自 QWRT：graceful = 优雅重启 + 6 秒 sysrq 兜底（默认）
+       * v5 新增 ensure_dad_guard()：每轮核对 DADGUARD 链，缺了自动重建。
+         AP 做全量无线重启时内核会卸载 ebtables（syslog: "Ebtables v2.0 unregistered"），
+         DADGUARD 连规则一起消失，而 started_script.sh 只在开机跑一次不会补 —— 
+         没有这层自愈，AP 重启过无线之后 IPv6 故障会静默复发。
      - 写入 /etc/storage/reboot-hard.sh（QWRT 的 /usr/bin/reboot-hard：内核级紧急重启）
      - 写入 /etc/storage/reboot-safe.sh（QWRT 的 /sbin/reboot 包装器：优雅优先 + 兜底）
      - 给 started_script.sh 追加启动钩子（pid 文件 + start-stop-daemon，不依赖 cron）
@@ -35,13 +39,19 @@ BLOCK = r'''
 func_tsl_fixes()
 {
 	WD="/etc/storage/ap_watchdog.sh"
-	# 带版本标记：缺失或旧版时自动写入/升级；已是 v4 就不动
-	if [ ! -f "$WD" ] || ! grep -q "watchdog-version: v4-generic" "$WD" ; then
+	# 带版本标记：缺失或旧版时自动写入/升级；已是 v5 就不动
+	if [ ! -f "$WD" ] || ! grep -q "watchdog-version: v5-generic" "$WD" ; then
 		cat > "$WD" <<'TSLEOF'
 #!/bin/sh
 # ================= 桥接看门狗（通用版）=================
 # 上级路由失联 -> 重启本机。由 install-ap-fixes.py 安装。
-# watchdog-version: v4-generic
+# watchdog-version: v5-generic
+#
+# v5 相对 v4：新增 ensure_dad_guard()，每轮核对 IPv6 DAD 防护链并自愈。
+#   AP 做全量无线重启时内核会卸载 ebtables 模块（syslog 里能看到
+#   "Ebtables v2.0 unregistered"），DADGUARD 链连规则一起消失；
+#   started_script.sh 只在开机跑一次、不会重建，于是之后再走无线中继的
+#   电视/盒子又会 dadfailed、拿不到 IPv6。自愈这层就是为了堵这个洞。
 #
 # 重启逻辑移植自之前的 QWRT 固件（MTK 平台正常关机流程可能卡死）：
 #   graceful = 优雅重启优先，同时武装一个内核级兜底定时器
@@ -87,6 +97,45 @@ alive() {
 	return 1
 }
 
+# ---- IPv6 DAD 防护自愈 ----
+# 为什么要这层：AP 做一次**全量无线重启**（网页保存无线设置 / radio*_restart /
+# 本脚本的 soft_recover 都算）时，内核会把 ebtables 模块卸载掉 —— syslog 里
+# 表现为 17:xx:xx kernel: Ebtables v2.0 unregistered —— DADGUARD 链连同里面
+# 8 条规则一起消失。而 started_script.sh 里的 ipv6-dad-guard 段只在开机执行
+# 一次，此后没有任何重建路径，于是所有走无线中继的电视/盒子又回到 dadfailed、
+# 拿不到 IPv6 的状态（故障是静默复发的，页面上看不出来）。
+# 这里每轮用零成本方式核对一次，缺了就按与开机段完全相同的规则重建。
+ensure_dad_guard() {
+	case "$(nvram get sw_mode)" in
+		2|3) ;;
+		*) return 0 ;;
+	esac
+	[ "$(nvram get ipv6_dad_guard)" = "0" ] && return 0
+	_eb=/bin/ebtables
+	[ -x "$_eb" ] || _eb=/usr/sbin/ebtables
+	[ -x "$_eb" ] || _eb=/sbin/ebtables
+	# 只能用路径判断，不能用 `command -v`：本机 /bin/sh 是 busybox，返回 127
+	[ -x "$_eb" ] || return 0
+	# 快路径：模块还在 + 链里 8 条规则 + FORWARD 挂着跳转 -> 判定完好，什么都不做。
+	# 先看 /proc/modules 是为了避免在「模块已被卸载」时白跑一次 ebtables。
+	if grep -q '^ebtable_filter' /proc/modules 2>/dev/null ; then
+		_n=$($_eb -L DADGUARD 2>/dev/null | grep -c 'icmp-type')
+		if [ "${_n:-0}" -ge 8 ] && $_eb -L FORWARD 2>/dev/null | grep -q DADGUARD ; then
+			return 0
+		fi
+	fi
+	$_eb -N DADGUARD 2>/dev/null
+	$_eb -F DADGUARD 2>/dev/null
+	for _dif in ra0 rax0 ra1 rax1 ; do
+		[ -e "/sys/class/net/$_dif" ] || continue
+		$_eb -A DADGUARD -p IPv6 --ip6-proto ipv6-icmp --ip6-icmp-type 135 --ip6-src ::/128 -i "$_dif" -j DROP 2>/dev/null
+		$_eb -A DADGUARD -p IPv6 --ip6-proto ipv6-icmp --ip6-icmp-type 135 --ip6-src ::/128 -o "$_dif" -j DROP 2>/dev/null
+	done
+	for _dk in 1 2 3 ; do $_eb -D FORWARD -j DADGUARD 2>/dev/null || break ; done
+	$_eb -I FORWARD 1 -j DADGUARD 2>/dev/null || $_eb -A FORWARD -j DADGUARD 2>/dev/null
+	log "DADGUARD rebuilt (was missing after wireless restart)"
+}
+
 # 软恢复：重启 5G 无线（桥接用的 apcli0 在 5G 上），再补挂一次网桥
 soft_recover() {
 	[ -x /sbin/radio2_restart ] && /sbin/radio2_restart
@@ -95,6 +144,8 @@ soft_recover() {
 		[ -e "/sys/class/net/$i" ] && brctl addif br0 "$i" 2>/dev/null
 	done
 	log "soft wireless restart done"
+	# 无线重启必然把 ebtables 模块带走，这一步之后必须重建 DAD 防护
+	ensure_dad_guard
 }
 
 # 内核级紧急重启（对应 QWRT 的 /usr/bin/reboot-hard）：
@@ -136,6 +187,8 @@ do_reboot() {
 }
 
 check_once() {
+	# 先自愈再探活：DAD guard 与上行是否通无关，掉了一轮都不能等
+	ensure_dad_guard
 	gw=$(get_gw)
 	if [ -z "$gw" ] ; then
 		# 取不到网关（例如刚开机还没起路由）时不算失联，避免误重启
@@ -196,7 +249,16 @@ case "$1" in
 		esac
 		while true ; do
 			check_once
-			sleep "$INTERVAL"
+			# 分段等待：每 30 秒顺手核对一次 DAD 防护。无线重启（保存设置 /
+			# radio*_restart）会把 ebtables 模块卸载、规则全丢，用 30 秒粒度
+			# 才能保证「重启完刚连上 WiFi 的电视」不会在那个空窗里 dadfailed。
+			# 冗余调用无害：快路径只读 /proc/modules，规则齐就立即返回。
+			_w=0
+			while [ "$_w" -lt "$INTERVAL" ] ; do
+				sleep 30
+				ensure_dad_guard
+				_w=$((_w + 30))
+			done
 		done ;;
 esac
 TSLEOF
