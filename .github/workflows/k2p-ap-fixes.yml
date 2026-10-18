@@ -136,6 +136,15 @@ jobs:
             echo "!! 用了 command -v —— 本机 busybox sh 不支持(exit 127)，规则会静默不生效"; exit 1
           fi
           echo "OK：DAD guard 已烤进 started_script.sh（只拦源 :: 的 NS，RA/mDNS 不受影响）"
+          echo "--- 附加校验：reboot 兜底必须是 v4（平时 6 秒 / 刷机时 180 秒）---"
+          grep -n 'sysrq-fallback: v' "$F"
+          grep -q 'sysrq-fallback: v4' "$F" \
+            || { echo "!! shutdown_script 不是 v4，中止"; exit 1; }
+          grep -q '_t=180' "$F" \
+            || { echo "!! 刷机时没把兜底延到 180 秒 —— 写完固件不重启就只能人工断电"; exit 1; }
+          if grep -q 'sysrq-fallback: v3' "$F" ; then
+            echo "!! 残留 v3 标记，说明旧块没清干净"; exit 1
+          fi
           # func_tsl_fixes 里出现 nvram 调用会触发 fill 阶段死锁（整机卡启动），硬拦。
           # 判据必须「跳过 heredoc 正文 + 跳过注释行」：
           #   heredoc 正文里的 `case "$(nvram get sw_mode)"` 是 ap_watchdog.sh 的内容，
