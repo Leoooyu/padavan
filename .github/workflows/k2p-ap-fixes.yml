@@ -6,7 +6,7 @@ name: Build K2P-NANO with AP fixes
 # 约 30~60 分钟（第二次起有 ccache 缓存，会快很多；期间可以关网页）
 # 编好后在该次运行页面底部 Artifacts 里下载 → 得到 .trx
 #
-# 这个固件相对原版做了四件事：
+# 这个固件相对原版做了五件事：
 #   1) 内置「AP 看门狗 + 可靠重启」（见 .github/patch_mtd_storage.py）
 #   2) 去掉「QoS 限速」(SQM)：包不编译、网页页面删掉、菜单项消失
 #   3) 5G 信道带宽默认值 20/40/80MHz → 20/40MHz（见 .github/patch_k2p_wifi_defaults.py）
@@ -14,6 +14,13 @@ name: Build K2P-NANO with AP fixes
 #   4) 修好「自带定时重启」（见 .github/patch_k2p_watchdog_sched.py）
 #      原版 watchdog.c 的门槛 `atoi(reboot_schedule) > 2359` 对 11 位纯数字串必然溢出
 #      → 定时重启永不触发（真机 A/B 实测确认）
+#   5) 修好「无线中继下电视盒子 / 智能电视拿不到 IPv6」（见 .github/patch_mtd_storage.py）
+#      3-address 中继会改写客户端源 MAC，客户端自己的 DAD 探测被桥的组播泛洪绕回来
+#      → 内核判定地址冲突 → dadfailed → 该地址永久不可用。
+#      固件在启动时于无线口丢弃「源地址 :: 的 NS」（RFC 4862 规定的 DAD 唯一形式），
+#      只拦这一种，RA / 正常 ND / mDNS / 投屏发现都不受影响。
+#      手机用隐私地址（每次重试换 IID）所以逃得掉 —— 这就是「只有电视类设备中招」的原因。
+#      默认只在 AP / 中继模式(sw_mode=2/3)生效；关掉：nvram set ipv6_dad_guard=0
 #   另：K2P 出厂 2.4G/5G 改成**开放网络（无密码）**，删掉预置口令 1234567890
 #
 # 说明：
@@ -84,7 +91,7 @@ jobs:
             build-essential help2man pkg-config zlib1g-dev libgmp3-dev libmpc-dev libmpfr-dev \
             libncurses5-dev libltdl-dev wget libc-dev-bin
 
-      - name: 7) 打补丁：把「AP 看门狗 + 可靠重启」写进固件
+      - name: 7) 打补丁：看门狗 + 可靠重启 + IPv6 修复写进固件
         run: |
           set -e
           # 优先取文件名就叫 mtd_storage.sh 的那个；取不到再退回第一个命中
@@ -94,11 +101,54 @@ jobs:
           test -n "$F"
           python3 .github/patch_mtd_storage.py "$F"
 
-          echo "--- 校验 1/2：函数与调用点（应为 1 个定义 + 3 个调用）---"
+          echo "--- 校验 1/4：函数与调用点（应为 1 个定义 + 3 个调用）---"
           grep -n 'func_tsl_fixes' "$F"
 
-          echo "--- 校验 2/2：补丁差异（开头 40 行）---"
-          diff -u "$F.orig" "$F" | head -40 || true
+          echo "--- 校验 2/4：补丁差异（开头 60 行）---"
+          diff -u "$F.orig" "$F" | head -60 || true
+
+          echo "--- 校验 3/4：IPv6 组播修复块必须烤进去（br0 snooping / disable_ipv6）---"
+          grep -n 'ipv6-mcast-fix: v1' "$F"
+          grep -q 'echo 0 > /sys/class/net/br0/bridge/multicast_snooping' "$F" \
+            || { echo "!! 缺 br0 multicast_snooping=0，AP 上 5G 客户端的 IPv6 RA 会断"; exit 1; }
+          grep -q 'ipv6/conf/\$_if/disable_ipv6' "$F" \
+            || { echo "!! 缺 disable_ipv6=0 循环"; exit 1; }
+
+          echo "--- 校验 4/4：IPv6 DAD 探测拦截块（无线中继下防 dadfailed）---"
+          grep -n 'ipv6-dad-guard: v1' "$F"
+          grep -q -- '--ip6-icmp-type 135' "$F" \
+            || { echo "!! 缺 NS(type 135) 匹配 —— DAD 探测拦不下来"; exit 1; }
+          grep -q -- '--ip6-src ::/128' "$F" \
+            || { echo "!! 缺「源地址 ::」限定 —— 不加会把正常邻居发现也一起拦掉"; exit 1; }
+          grep -q 'FORWARD 1 -j DADGUARD' "$F" \
+            || { echo "!! DAD guard 没挂到 FORWARD 链"; exit 1; }
+          # 该段在 rc 启动流程里直接执行：出现 exit / return 会把整机启动掐断 —— 硬拦。
+          # 只看非注释行（注释里提到这两个词是正常的）。
+          if awk '/ipv6-dad-guard: v1/,/ipv6-dad-guard <<</' "$F" \
+               | grep -v '^[[:space:]]*#' \
+               | grep -qE '(^|[;&|[:space:]])(exit|return)([[:space:]]|$)' ; then
+            echo "!! DAD guard 段里出现 exit/return —— 会掐断 rc 启动流程，中止"; exit 1
+          fi
+          # /bin/sh 是 busybox，`command -v` 返回 127（实测），用它做守卫会让整段静默跳过。
+          if awk '/ipv6-dad-guard: v1/,/ipv6-dad-guard <<</' "$F" \
+               | grep -v '^[[:space:]]*#' \
+               | grep -q 'command -v' ; then
+            echo "!! 用了 command -v —— 本机 busybox sh 不支持(exit 127)，规则会静默不生效"; exit 1
+          fi
+          echo "OK：DAD guard 已烤进 started_script.sh（只拦源 :: 的 NS，RA/mDNS 不受影响）"
+          # func_tsl_fixes 里出现 nvram 调用会触发 fill 阶段死锁（整机卡启动），硬拦。
+          # 判据必须「跳过 heredoc 正文 + 跳过注释行」：
+          #   heredoc 正文里的 `case "$(nvram get sw_mode)"` 是 ap_watchdog.sh 的内容，
+          #   运行时才执行，不算函数体内调用；注释里出现 nvram 字样也不算。
+          echo "--- 附加校验：func_tsl_fixes 函数体内不得真正执行 nvram（fill 阶段会死锁）---"
+          awk '
+            /^func_tsl_fixes\(\)/ { inf = 1 }
+            inf && /<<.TSLEOF.$/ { skip = 1 ; next }
+            skip && /^TSLEOF$/ { skip = 0 ; next }
+            inf && /^# ===== end of tsl baked-in fixes =====/ { exit }
+            inf && !skip && $0 !~ /^[[:space:]]*#/ { print }
+          ' "$F" | grep -nE 'nvram[[:space:]]+(get|set|commit|unset|show)' \
+            && { echo "!! func_tsl_fixes 里出现 nvram 调用 —— fill 阶段会死锁，中止"; exit 1; } || true
 
       - name: 8) 打补丁：K2P 的 5G/2.4G 高级默认值对齐实测配置 + 出厂开放网络
         run: |
