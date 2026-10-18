@@ -12,6 +12,8 @@
      - 写入 /etc/storage/reboot-hard.sh（QWRT 的 /usr/bin/reboot-hard：内核级紧急重启）
      - 写入 /etc/storage/reboot-safe.sh（QWRT 的 /sbin/reboot 包装器：优雅优先 + 兜底）
      - 给 started_script.sh 追加启动钩子（pid 文件 + start-stop-daemon，不依赖 cron）
+     - 给 started_script.sh 追加 IPv6 组播修复段（br0 snooping=0 + 各口 disable_ipv6=0）
+     - 给 started_script.sh 追加 IPv6 DAD 探测拦截段（无线中继 / MAC 转换下防 dadfailed）
      - 给 shutdown_script.sh 追加 sysrq 兜底（正常关机优先，卡住 6 秒强制重启）
   2) 在 case "$1" 的 load) / reset) / fill) 分支里调用这个块，保证
      - 首次开机（fill/reset）就写进去
@@ -264,6 +266,85 @@ PIDF=/var/run/ap_watchdog.pid
 if [ ! -s "$PIDF" ] || ! kill -0 "$(cat "$PIDF" 2>/dev/null)" 2>/dev/null ; then
 	start-stop-daemon -S -b -m -p "$PIDF" -x /bin/sh -- -c '/etc/storage/ap_watchdog.sh'
 fi
+TSLEOF
+	fi
+	# ---- IPv6 组播修复 ----
+	# 两项都是**运行时 sysfs**（重启回内核默认），所以必须放在启动钩子里每次重放：
+	#  1) br0 桥的 IGMP/MLD snooping 默认 1。本方案回程是「2.4G 无线 STA」(apclix0 桥进 br0)，
+	#     无线链路的 IGMP/MLD 查询本来就容易丢；桥的组播成员表一老化，就会**停止把组播
+	#     转发给 5G 客户端** -> 老设备连 5G 拿不到 IPv6（RA ff02::1 到不了），
+	#     AirPlay/Chromecast 时好时坏。实机踩过。
+	#  2) 内核默认给非 br-lan 端口 disable_ipv6=1，同样挡住 RA。
+	# ⚠️ 别指望 nvram 的 wl_IgmpSnEnable / rt_IgmpSnEnable：K2P 这个编译配置下它不生效
+	#    （net_wifi.c 的 brport_set_m2u 被 USE_IGMP_SNOOP 编译掉了；实测
+	#      ra0/brport/multicast_to_unicast 恒为 0，改 nvram 纹丝不动）。实测结论，别再走弯路。
+	if ! grep -q "ipv6-mcast-fix: v1" "$ST" ; then
+		cat >> "$ST" <<'TSLEOF'
+
+# >>> ipv6-mcast-fix: v1 >>>
+# IPv6 组播（RA / mDNS）修复 —— 两项都是运行时 sysfs，重启即回默认，必须每次启动重放。
+#
+# 1) 关 br0 内核桥的 IGMP/MLD snooping（内核默认 =1）。
+#    本方案回程是「2.4G 无线 STA」(apclix0 桥进 br0)，无线链路上 IGMP/MLD 查询容易丢；
+#    桥的组播成员表一老化，它就会停止把组播帧转发给 5G 客户端 ——
+#    表现：老设备（Android 盒子等）连 5G 拿不到 IPv6，AirPlay/Chromecast 时好时坏。
+#    实测 nvram 的 wl_IgmpSnEnable / rt_IgmpSnEnable 在本编译配置下不生效
+#    （net_wifi.c 的 brport_set_m2u 被 USE_IGMP_SNOOP 编译掉了；
+#     实测 ra0/brport/multicast_to_unicast 恒为 0，改 nvram 纹丝不动），只能直接写 sysfs。
+#
+# 2) 放开 ra0/rax0/apclix0/br0 的 disable_ipv6（内核默认给非 br-lan 端口置 1，RA 进不来）。
+for _i in 1 2 3 4 5 6 7 8 9 10 ; do [ -e /sys/class/net/ra0 ] && break ; sleep 1 ; done
+echo 0 > /sys/class/net/br0/bridge/multicast_snooping 2>/dev/null
+for _if in ra0 rax0 apclix0 br0 ; do
+	echo 0 > /proc/sys/net/ipv6/conf/$_if/disable_ipv6 2>/dev/null
+done
+# <<< ipv6-mcast-fix <<<
+TSLEOF
+	fi
+	# ---- IPv6 DAD 探测拦截（无线中继 / MAC 转换专属问题）----
+	# 3-address 无线中继（apcli STA 回程）会把客户端的源 MAC 改写成 AP 的代理 MAC。
+	# 客户端做 DAD 时发的 NS（源地址 ::，目的 solicited-node 组播）会被桥的组播泛洪绕回来，
+	# 而源 MAC 已经不是它自己 -> 客户端内核判定「另一节点也在用这个地址」-> 该地址 dadfailed。
+	# 用 EUI-64 固定地址的设备（电视盒子 / 智能电视）重试还是同一个地址，永远逃不掉；
+	# 用隐私地址的手机每次重试换 IID，所以看不出问题 —— 这就是「电视全没 IPv6、手机正常」的成因。
+	# 处理：在无线口入口丢弃 DAD 探测。不发就不会撞车，内核走「DAD 超时」路径正常启用地址。
+	# 只匹配「源地址 :: 的 NS」= RFC 4862 规定的 DAD 唯一形式
+	#   -> RA / 正常 ND / mDNS / SSDP / DLNA 零影响，这也是它比「关组播」安全的原因
+	#      （关组播会连 RA ff02::1 一起杀掉，等于关掉整个 IPv6）。
+	# 代价：无线客户端失去 DAD 冲突检测（静态配成重复地址会静默冲突），家庭网络可接受。
+	# 只在 AP / 中继模式（sw_mode=2/3）启用；不需要时 `nvram set ipv6_dad_guard=0; nvram commit`。
+	if ! grep -q "ipv6-dad-guard: v1" "$ST" ; then
+		cat >> "$ST" <<'TSLEOF'
+
+# >>> ipv6-dad-guard: v1 >>>
+# 无线中继(MAC 转换)下，客户端自己发的 DAD 探测会被桥的组播泛洪绕回来，
+# 源 MAC 已变成 AP 的代理 MAC -> 客户端内核判定地址冲突 -> dadfailed -> 该地址永久不可用。
+# 这里把无线口的 DAD 探测（ICMPv6 NS，源地址 ::）在入口丢弃：不发就不撞车，
+# 内核走「DAD 超时」路径正常启用地址（多约 1 秒）。
+# 只匹配 RFC 4862 规定的 DAD 唯一形式，RA / 正常 ND / mDNS / SSDP 完全不受影响。
+# 只在 AP / 中继模式(sw_mode=2/3)生效；关掉：nvram set ipv6_dad_guard=0; nvram commit
+# 注意：本段在 rc 启动流程里被执行，不可提前终止流程（不能掐断 rc）。
+# ⚠️ 判 ebtables 是否存在只能看路径，**不要用 `command -v`**：
+#    本机 /bin/sh 是 busybox，`command -v` 返回 127（不支持），整段会被静默跳过（实测踩过）。
+case "$(nvram get sw_mode)" in
+	2|3)
+		if [ "$(nvram get ipv6_dad_guard)" != "0" ] && { [ -x /bin/ebtables ] || [ -x /usr/sbin/ebtables ] || [ -x /sbin/ebtables ] ; } ; then
+			for _i in 1 2 3 4 5 6 7 8 9 10 ; do [ -e /sys/class/net/ra0 ] && break ; sleep 1 ; done
+			# 自定义链：每次重建，天然幂等，反复执行也不会堆积规则
+			ebtables -N DADGUARD 2>/dev/null
+			ebtables -F DADGUARD 2>/dev/null
+			for _if in ra0 rax0 ra1 rax1 ; do
+				[ -e "/sys/class/net/$_if" ] || continue
+				ebtables -A DADGUARD -p IPv6 --ip6-proto ipv6-icmp --ip6-icmp-type 135 --ip6-src ::/128 -i "$_if" -j DROP 2>/dev/null
+				ebtables -A DADGUARD -p IPv6 --ip6-proto ipv6-icmp --ip6-icmp-type 135 --ip6-src ::/128 -o "$_if" -j DROP 2>/dev/null
+			done
+			for _k in 1 2 3 ; do ebtables -D FORWARD -j DADGUARD 2>/dev/null || break ; done
+			ebtables -I FORWARD 1 -j DADGUARD 2>/dev/null || ebtables -A FORWARD -j DADGUARD 2>/dev/null
+			logger -t dadguard "wireless IPv6 DAD probes dropped"
+		fi
+		;;
+esac
+# <<< ipv6-dad-guard <<<
 TSLEOF
 	fi
 	# ---- 关机兜底（v2 加固）----
