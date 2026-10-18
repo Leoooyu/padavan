@@ -1,12 +1,15 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-patch_k2p_wifi_defaults.py
+patch_k2p_wifi_defaults.py   (v7)
 ==========================
-把 Padavan 里 **K2P 的 5G 高级参数默认值** 对齐到「两台 AP 实测在用的那套配置」，
-这样**恢复出厂 / 不保留配置刷机**之后，5G 出厂值就是我们要的，不用再手工去网页里点一遍。
+把 Padavan 里 **K2P 的无线默认值** 对齐到「三台设备实测在用的那套配置」，
+这样**恢复出厂 / 不保留配置刷机**之后，出厂值就是我们要的，不用再手工去网页里点一遍。
 
-改三处（都只对 K2P 生效，其它机型行为完全不变）
+v7 变更：撤掉 v6 的降功率（rt/wl_TxPower 回到 100），新增 rt_HT_BW=0（2.4G 钉 20MHz）。
+        最终形态 = 2.4G: ch11 / HT20 / 100% / K-V-R 全关；5G: ch149 / VHT40 / 100% / K-V 开、R 关。
+
+改以下各项（都只对 K2P 生效，其它机型行为完全不变）
 ------------------------------------------------
 1) `wl_HT_BW`  : 20/40/80 MHz(2)  ->  20/40 MHz(1)
    K2P 的 board.h 里有 `#define BOARD_HAS_5G_11AC 1`，所以出厂默认是 80MHz。
@@ -57,16 +60,21 @@ patch_k2p_wifi_defaults.py
    钉死 149 后开机即在主路由信道上，回程关联更快、链路更稳。
    ⚠️ 5.8G 频段（149~165）在国内是开放频段，27dBm 功率不受限制；且 5.8G 比 5.2G 更安静。
 
-11) `rt_TxPower` : 100 -> 20   【v6 新增：2.4G 功率默认 20%】
-12) `wl_TxPower` : 100 -> 40   【v6 新增：5G 功率默认 40%】
-   与主路由 QWRT 的 `def_txp=20 / 40` 完全一致（同一颗 MT76 驱动，txpower 是
-   **0~100 的百分比**，不是 dBm：实测 2.4G 20% ≈ 21~24dBm、5G 40% ≈ 24dBm、100% = 27dBm）。
-   三台机器都开满 27dBm 时覆盖重叠太狠，客户端根本没有换 AP 的理由 —— 这正是
-   「漫游不灵敏」的第一号原因。统一降到 20/40 才能造出覆盖边界。
+11) `rt_HT_BW` : 1(20/40MHz) -> 0(20MHz only)   【v7 新增：2.4G 带宽钉 20MHz】
+   主路由 QWRT 的 2.4G 已是 `htmode=HT20`，AP 作为回程 STA 本来也只能协商到 20MHz；
+   但把 nvram 默认值也钉成 0，才不会出现「主路由哪天改 40，AP 单方面跟着开 40」的情况。
+   实测依据：现场扫到 10 个邻居 AP，第二强的 CMCC-FtSM 在 **ch7 上 -69dBm**。
+   ch11 的 40MHz 只能向下延伸到 ch7（往上出界），等于把那个干扰正式请进带宽里，
+   CCA 会频繁退避，实际吞吐经常还不如 HT20。所以 2.4G 就是 20MHz。
 
-   ⚠️ 2.4G 是**回程**频段（apclix0 连主路由），功率压到 20% 会同时压低上行。
-      实测 AP 与主路由距离在 5 米内时链路余量足够；若回程 RSSI 掉到 -70dBm 以下，
-      把这一项改回 100（或只把 2.4G 改回 100、5G 保持 40）。
+12) 5G `wl_HT_BW` 保持 1（20/40MHz），也就是实测在跑的 **VHT40**。
+   5G 频段干净、带宽够，40MHz 已经能同时喂饱回程和客户端；80MHz 在这里换不到吞吐。
+
+**功率：两频段都保持 100（满功率 27dBm）** —— v7 撤掉了 v6 的 20/40 降功率。
+  降功率实测是净亏：AP 的 2.4G 就是回程（apclix0），100→20% 让 AP .2 回程从
+  113 掉到 99 Mbps、AP .3 从 78 掉到 64 Mbps；而主路由站在自己位置仍能收到
+  两台 AP 的 5G 为 **-61 / -65 dBm**，依然落在强信号区，客户端照样没理由换 AP。
+  结论：这个环境里「降功率造覆盖边界」不可行，功率回到 100，漫游另想他法。
 
 **K/V/R 双频段终局（与主路由 QWRT 完全一致）**：
   * 2.4G：`rt_HT_80211KV = 0`（K/V 关）+ `rt_HT_80211R = 0`（R 关）
@@ -342,33 +350,23 @@ def main():
         print("[%s]" % msg)
         changed.append("wl_channel=149")
 
-    # ---------- 3g) rt_TxPower (2.4G) ----------
-    if re.search(r'(?m)^[ \t]*\{ "rt_TxPower", "20" \},', src):
-        print("[跳过] rt_TxPower 已经是 20")
-    else:
-        src, msg = wrap_k2p_any(
-            src,
-            '{ "rt_TxPower", "100" },',
-            '{ "rt_TxPower", "20" },',
-            "\t\t\t/* TX power % — K2P：2.4G 默认 20%，与 QWRT 主路由一致 */",
-            "rt_TxPower(2.4G)",
-        )
-        print("[%s]" % msg)
-        changed.append("rt_TxPower=20")
+    # ---------- 3g) rt_HT_BW (2.4G 带宽钉 20MHz) ----------
+    # v7：功率回到 100（撤掉 v6 的 20/40），改成钉 2.4G 带宽。
+    # 原厂 rt_HT_BW=1 是「20/40 自适应」，对端只给 20 时不会真上 40；但主路由哪天
+    # 改成 HT40，AP 就会跟着开 —— 而我们已确认 ch7 有 -69dBm 邻居干扰，不能开 40。
+    src, did = pin_default(
+        src, "rt_HT_BW", "0",
+        "\t\t/* Channel width — K2P：2.4G 只跑 20MHz（ch7 邻居 -69dBm，不能向下扩到 40） */",
+        "rt_HT_BW(2.4G)",
+    )
+    if did:
+        changed.append("rt_HT_BW=0")
 
-    # ---------- 3h) wl_TxPower (5G) ----------
-    if re.search(r'(?m)^[ \t]*\{ "wl_TxPower", "40" \},', src):
-        print("[跳过] wl_TxPower 已经是 40")
+    # 5G 带宽护栏：K2P 必须是 1（20/40MHz = VHT40），别让上游把默认值改回 2(80MHz)。
+    if re.search(r'(?m)^[ \t]*\{ "wl_HT_BW", "1" \},', src):
+        print("[校验] wl_HT_BW  -> K2P 分支是 1（20/40MHz = VHT40）✓")
     else:
-        src, msg = wrap_k2p_any(
-            src,
-            '{ "wl_TxPower", "100" },',
-            '{ "wl_TxPower", "40" },',
-            "\t\t\t/* TX power % — K2P：5G 默认 40%，与 QWRT 主路由一致 */",
-            "wl_TxPower(5G)",
-        )
-        print("[%s]" % msg)
-        changed.append("wl_TxPower=40")
+        fail("校验失败：找不到 K2P 的 wl_HT_BW=1（5G 带宽被改坏了，中止）")
 
     # ---------- 3i) K/V/R 收口：2.4G = 0/0/0，5G = 1/1/0 ----------
     # 2.4G 的 K/V 已在 3e 改成 0；这里把剩下三个「应为」的值也钉住。
@@ -464,15 +462,22 @@ def main():
     else:
         fail("校验失败：找不到 K2P 的 wl_channel=149")
 
-    if re.search(r'(?m)^[ \t]*\{ "rt_TxPower", "20" \},', src):
-        print("[校验] rt_TxPower  -> 20（K2P 分支）✓")
+    if re.search(r'(?m)^[ \t]*\{ "rt_HT_BW", "0" \},', src):
+        print("[校验] rt_HT_BW  -> 0（K2P 分支，2.4G 只跑 20MHz）✓")
     else:
-        fail("校验失败：找不到 K2P 的 rt_TxPower=20")
+        fail("校验失败：找不到 K2P 的 rt_HT_BW=0")
 
-    if re.search(r'(?m)^[ \t]*\{ "wl_TxPower", "40" \},', src):
-        print("[校验] wl_TxPower  -> 40（K2P 分支）✓")
+    if re.search(r'(?m)^[ \t]*\{ "wl_HT_BW", "1" \},', src):
+        print("[校验] wl_HT_BW  -> 1（K2P 分支，5G 跑 VHT40）✓")
     else:
-        fail("校验失败：找不到 K2P 的 wl_TxPower=40")
+        fail("校验失败：找不到 K2P 的 wl_HT_BW=1")
+
+    # 功率：v7 起两频段都保持原厂 100。若上游把默认值改成别的数字，这里要报出来。
+    if not re.search(r'(?m)^[ \t]*\{ "rt_TxPower", "100" \},', src):
+        fail("校验失败：2.4G 默认功率不是 100（v7 已撤掉降功率，不该再出现别的值）")
+    if not re.search(r'(?m)^[ \t]*\{ "wl_TxPower", "100" \},', src):
+        fail("校验失败：5G 默认功率不是 100（v7 已撤掉降功率，不该再出现别的值）")
+    print("[校验] rt_TxPower / wl_TxPower 均为 100（满功率）✓")
 
     # K/V/R 终局：2.4G 0/0/0，5G 1/1/0
     for key, want in (('rt_HT_80211KV', "0"), ('wl_HT_80211KV', "1"),
@@ -502,11 +507,12 @@ def main():
             if "#else" not in nxt or "#endif" not in nxt:
                 fail("预处理块不完整：第 %d 行 `#ifdef BOARD_K2P` 后面 5 行内找不到 #else/#endif" % (i + 1))
     print("[校验] %d 处 #ifdef BOARD_K2P 三行结构完整 ✓" % src.count("#ifdef BOARD_K2P"))
-    print("[校验] 双频段默认功率已钉 20/40（原厂 100/100）✓")
+    print("[校验] 双频段默认功率保持 100/100（v7 已撤掉降功率）✓")
 
     print()
     print("OK：K2P 出厂默认 = %s" % (", ".join(changed) if changed else "（本次无变化）"))
-    print("OK：2.4G 信道 11 / 功率 20 / K-V-R 全关；5G 信道 149 / 功率 40 / K-V 开、R 关")
+    print("OK：2.4G 信道 11 / 带宽 20MHz / 功率 100 / K-V-R 全关；"
+          "5G 信道 149 / 带宽 20-40MHz(VHT40) / 功率 100 / K-V 开、R 关")
     if OPEN_DEFAULT_WIFI:
         print("OK：K2P 出厂 2.4G/5G = 开放网络（无密码）；其它机型仍是 psk + 1234567890")
     print("OK：其它 11AC 机型仍为 wl_HT_BW=2 / wl_wme=1，完全不受影响")
