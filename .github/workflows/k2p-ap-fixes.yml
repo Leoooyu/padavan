@@ -9,8 +9,10 @@ name: Build K2P-NANO with AP fixes
 # 这个固件相对原版做了五件事：
 #   1) 内置「AP 看门狗 + 可靠重启」（见 .github/patch_mtd_storage.py）
 #   2) 去掉「QoS 限速」(SQM)：包不编译、网页页面删掉、菜单项消失
-#   3) 5G 信道带宽默认值 20/40/80MHz → 20/40MHz（见 .github/patch_k2p_wifi_defaults.py）
-#      —— 与主路由 QWRT 侧的 VHT40 对齐，避免同信道无线回程(apcli0)在 80MHz 下丢包
+#   3) 无线默认值对齐主路由 QWRT（见 .github/patch_k2p_wifi_defaults.py）
+#      2.4G：信道 11 / 功率 20% / K、V、R 全关
+#      5G  ：信道 149 / 功率 40% / K、V 开、R 关（同 5G 带宽 20/40MHz）
+#      —— 与主路由 QWRT 的 def_chan / def_txp / kvr 完全一致
 #   4) 修好「自带定时重启」（见 .github/patch_k2p_watchdog_sched.py）
 #      原版 watchdog.c 的门槛 `atoi(reboot_schedule) > 2359` 对 11 位纯数字串必然溢出
 #      → 定时重启永不触发（真机 A/B 实测确认）
@@ -163,14 +165,24 @@ jobs:
           fi
           echo "OK：看门狗 v5 自带 DADGUARD 自愈（30 秒粒度，重启无线后必补）"
 
-          echo "--- 附加校验：reboot 兜底必须是 v4（平时 6 秒 / 刷机时 180 秒）---"
+          echo "--- 附加校验：reboot 兜底必须是 v5（平时 6 秒 / 刷机盯 mtd_write 自愈）---"
           grep -n 'sysrq-fallback: v' "$F"
-          grep -q 'sysrq-fallback: v4' "$F" \
-            || { echo "!! shutdown_script 不是 v4，中止"; exit 1; }
-          grep -q '_t=180' "$F" \
-            || { echo "!! 刷机时没把兜底延到 180 秒 —— 写完固件不重启就只能人工断电"; exit 1; }
-          if grep -q 'sysrq-fallback: v3' "$F" ; then
-            echo "!! 残留 v3 标记，说明旧块没清干净"; exit 1
+          grep -q 'sysrq-fallback: v5' "$F" \
+            || { echo "!! shutdown_script 不是 v5，中止"; exit 1; }
+          # 只看兜底块本身：ap_watchdog.sh 正文里也有 sysrq 语句，全局 grep 会误判
+          _SHB=$(awk '/sysrq-fallback: v5/,/sysrq-fallback <<</' "$F")
+          echo "$_SHB" | grep -q 'mtd_write' \
+            || { echo "!! 刷机兜底没有判 mtd_write 是否仍在写盘（v5）"; exit 1; }
+          echo "$_SHB" | grep -q '_idle' \
+            || { echo "!! 刷机兜底不是「进程退出 6 秒后接管」的自适应写法"; exit 1; }
+          echo "$_SHB" | grep -q 'echo b > /proc/sysrq-trigger' \
+            || { echo "!! 兜底里没有 sysrq-b"; exit 1; }
+          # v4 的致命缺陷：先 s 后 b，flash 写卡住时 s 会永久阻塞，b 永远发不出去
+          if echo "$_SHB" | grep -q 'echo s > /proc/sysrq-trigger' ; then
+            echo "!! 兜底里还有 sysrq-s —— 写卡住时会把整条兜底堵死（v5 改成后台 sync）"; exit 1
+          fi
+          if grep -qE 'sysrq-fallback: v(3|4)' "$F" ; then
+            echo "!! 残留 v3/v4 标记，说明旧块没清干净"; exit 1
           fi
           # func_tsl_fixes 里出现 nvram 调用会触发 fill 阶段死锁（整机卡启动），硬拦。
           # 判据必须「跳过 heredoc 正文 + 跳过注释行」：
@@ -197,49 +209,63 @@ jobs:
           #   4) rt_wme          1(开) -> 0(关)                   —— 2.4G WMM 对齐 QWRT
           #   5) rt_channel      0(auto) -> 11                    —— 2.4G 信道默认钉 11
           #   6) rt_HT_80211KV   1(开) -> 0(关)                   —— 2.4G KV 关，对齐 QWRT
-          #   7) wl/rt_auth_mode "psk" -> "open"、wl/rt_wpa_psk -> ""
+          #   7) wl_channel      0(auto) -> 149                   —— 5G 信道默认钉 149
+          #   8) rt_TxPower      100 -> 20                        —— 2.4G 功率默认 20%
+          #   9) wl_TxPower      100 -> 40                        —— 5G 功率默认 40%
+          #  10) wl/rt_auth_mode "psk" -> "open"、wl/rt_wpa_psk -> ""
           #      → K2P 出厂 2.4G/5G 即开放网络（无密码），删掉预置口令 1234567890
+          # 终局（与主路由 QWRT 完全一致）：
+          #   2.4G = 信道 11 / 功率 20 / K,V,R 全关
+          #   5G   = 信道 149 / 功率 40 / K,V 开、R 关
           # 只影响 K2P；其它机型的这些默认值完全不变。幂等。
           D="trunk/user/shared/src/defaults.c"
           test -f "$D"
           grep -n -B2 -A4 'wl_HT_BW' "$D" || true
           python3 .github/patch_k2p_wifi_defaults.py "$D"
 
-          echo "--- 校验 1/13：wl_HT_BW 的 K2P 分支 ---"
+          echo "--- 校验 1/15：wl_HT_BW 的 K2P 分支 ---"
           grep -n -A4 'BOARD_HAS_5G_11AC && !defined(BOARD_K2P)' "$D"
           grep -q 'BOARD_HAS_5G_11AC && !defined(BOARD_K2P)' "$D" || { echo "!! wl_HT_BW 补丁没打上，中止"; exit 1; }
-          echo "--- 校验 2/13：K2P 的 wl_wme=0 ---"
+          echo "--- 校验 2/15：K2P 的 wl_wme=0 ---"
           grep -n -B1 -A4 '"wl_wme", "0"' "$D"
           grep -q '"wl_wme", "0"' "$D" || { echo "!! wl_wme 没改成 0，中止"; exit 1; }
-          echo "--- 校验 3/13：K2P 的 wl_country_code=CN ---"
+          echo "--- 校验 3/15：K2P 的 wl_country_code=CN ---"
           grep -q '"wl_country_code", "CN"' "$D" || { echo "!! 5G 国家码没钉成 CN，中止"; exit 1; }
-          echo "--- 校验 4/13：K2P 的 rt_wme=0（2.4G WMM 对齐 QWRT）---"
+          echo "--- 校验 4/15：K2P 的 rt_wme=0（2.4G WMM 对齐 QWRT）---"
           grep -n -B1 -A2 '"rt_wme", "0"' "$D"
           grep -q '"rt_wme", "0"' "$D" || { echo "!! rt_wme 没改成 0，中止"; exit 1; }
-          echo "--- 校验 5/13：K2P 的 rt_channel=11（2.4G 信道默认钉 11）---"
+          echo "--- 校验 5/15：K2P 的 rt_channel=11（2.4G 信道默认钉 11）---"
           grep -n -B1 -A2 '"rt_channel", "11"' "$D"
           grep -q '"rt_channel", "11"' "$D" || { echo "!! rt_channel 没钉成 11，中止"; exit 1; }
-          echo "--- 校验 6/13：K2P 的 rt_HT_80211KV=0（2.4G KV 关，对齐 QWRT）---"
+          echo "--- 校验 6/15：K2P 的 rt_HT_80211KV=0（2.4G KV 关，对齐 QWRT）---"
           grep -n -B1 -A2 '"rt_HT_80211KV", "0"' "$D"
           grep -q '"rt_HT_80211KV", "0"' "$D" || { echo "!! rt_HT_80211KV 没改成 0，中止"; exit 1; }
-          echo "--- 校验 7/13：K2P 的 rt_country_code=CN ---"
+          echo "--- 校验 7/15：K2P 的 rt_country_code=CN ---"
           grep -q '"rt_country_code", "CN"' "$D" || { echo "!! 2.4G 国家码没钉成 CN，中止"; exit 1; }
-          echo "--- 校验 8/13：5G 默认发射功率必须保持 100（本次不动功率）---"
-          grep -q '"wl_TxPower", "100"' "$D" || { echo "!! 5G 默认功率不是 100，中止"; exit 1; }
-          echo "--- 校验 9/13：K2P 出厂 5G 不加密 ---"
+          echo "--- 校验 8/15：K2P 的 rt_TxPower=20（2.4G 功率 20%，与 QWRT 一致）---"
+          grep -n -B1 -A2 '"rt_TxPower", "20"' "$D"
+          grep -q '"rt_TxPower", "20"' "$D" || { echo "!! 2.4G 默认功率没改成 20，中止"; exit 1; }
+          echo "--- 校验 9/15：K2P 的 wl_TxPower=40（5G 功率 40%，与 QWRT 一致）---"
+          grep -n -B1 -A2 '"wl_TxPower", "40"' "$D"
+          grep -q '"wl_TxPower", "40"' "$D" || { echo "!! 5G 默认功率没改成 40，中止"; exit 1; }
+          echo "--- 校验 10/15：K2P 出厂 5G 不加密 ---"
           grep -q '{ "wl_auth_mode", "open" },' "$D" || { echo "!! 5G auth_mode 没改成 open，中止"; exit 1; }
           grep -q '{ "wl_wpa_psk", "" },' "$D" || { echo "!! 5G 预置口令没清空，中止"; exit 1; }
-          echo "--- 校验 10/13：K2P 出厂 2.4G 不加密 ---"
+          echo "--- 校验 11/15：K2P 出厂 2.4G 不加密 ---"
           grep -q '{ "rt_auth_mode", "open" },' "$D" || { echo "!! 2.4G auth_mode 没改成 open，中止"; exit 1; }
           grep -q '{ "rt_wpa_psk", "" },' "$D" || { echo "!! 2.4G 预置口令没清空，中止"; exit 1; }
-          echo "--- 校验 11/13：原厂 psk 宏只应剩在非 K2P 分支（各 1 处）---"
+          echo "--- 校验 12/15：原厂 psk 宏只应剩在非 K2P 分支（各 1 处）---"
           test "$(grep -c 'DEF_WLAN_5G_PSK' "$D")" = "1" || { echo "!! DEF_WLAN_5G_PSK 不是 1 处，中止"; exit 1; }
           test "$(grep -c 'DEF_WLAN_2G_PSK' "$D")" = "1" || { echo "!! DEF_WLAN_2G_PSK 不是 1 处，中止"; exit 1; }
-          echo "--- 校验 12/13：K2P 的 wl_channel=149（5G 默认信道钉 149）---"
+          echo "--- 校验 13/15：K2P 的 wl_channel=149（5G 默认信道钉 149）---"
           grep -n -B1 -A2 '"wl_channel", "149"' "$D"
           grep -q '"wl_channel", "149"' "$D" || { echo "!! 5G 默认信道没钉成 149，中止"; exit 1; }
-          echo "--- 校验 13/13：预处理块必须成对，否则会把后面整段吃掉 ---"
-          test "$(grep -c '^#ifdef BOARD_K2P' "$D")" = "11" || { echo "!! #ifdef BOARD_K2P 不是 11 处（应为 6 旧 + 5 新），中止"; exit 1; }
+          echo "--- 校验 14/15：K/V/R 终局（2.4G 0/0/0，5G 1/1/0，R 两频段都关）---"
+          grep -q '"wl_HT_80211KV", "1"' "$D" || { echo "!! 5G 的 K/V 没开，中止"; exit 1; }
+          grep -q '"rt_HT_80211R", "0"' "$D" || { echo "!! 2.4G 的 802.11R 不是 0，中止"; exit 1; }
+          grep -q '"wl_HT_80211R", "0"' "$D" || { echo "!! 5G 的 802.11R 不是 0，中止"; exit 1; }
+          echo "--- 校验 15/15：预处理块必须成对，否则会把后面整段吃掉 ---"
+          test "$(grep -c '^#ifdef BOARD_K2P' "$D")" = "13" || { echo "!! #ifdef BOARD_K2P 不是 13 处（应为 6 旧 + 7 新），中止"; exit 1; }
           rm -f "$D.orig"
 
       - name: 8b) 打补丁：修好「自带定时重启」永不触发的门槛
@@ -318,8 +344,13 @@ jobs:
           echo "--- 复核 2：看门狗脚本应已打进 storage 模板 ---"
           grep -c 'watchdog-version: v5-generic' trunk/user/scripts/files/sbin/mtd_storage.sh || true
           grep -c 'ensure_dad_guard' trunk/user/scripts/files/sbin/mtd_storage.sh || true
-          echo "--- 复核 3：5G 带宽默认值（应看到 K2P 走 20/40MHz 分支）---"
+          echo "--- 复核 3：无线默认值应与主路由 QWRT 一致 ---"
+          echo "    2.4G：信道 11 / 功率 20 / K,V,R 全关；5G：信道 149 / 功率 40 / K,V 开、R 关"
           grep -n -A4 'BOARD_HAS_5G_11AC && !defined(BOARD_K2P)' trunk/user/shared/src/defaults.c || true
+          grep -n -B1 -A2 '"rt_TxPower", "20"' trunk/user/shared/src/defaults.c || true
+          grep -n -B1 -A2 '"wl_TxPower", "40"' trunk/user/shared/src/defaults.c || true
+          grep -n -B1 -A2 '"rt_HT_80211KV", "0"' trunk/user/shared/src/defaults.c || true
+          grep -n -B1 -A2 '"wl_HT_80211KV", "1"' trunk/user/shared/src/defaults.c || true
           echo "--- 复核 4：K2P 出厂双频都是开放网络（无密码）---"
           grep -n -B1 -A4 '"wl_wpa_psk", ""' trunk/user/shared/src/defaults.c || true
           grep -n -B1 -A4 '"rt_wpa_psk", ""' trunk/user/shared/src/defaults.c || true
