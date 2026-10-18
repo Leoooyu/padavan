@@ -101,20 +101,20 @@ jobs:
           test -n "$F"
           python3 .github/patch_mtd_storage.py "$F"
 
-          echo "--- 校验 1/4：函数与调用点（应为 1 个定义 + 3 个调用）---"
+          echo "--- 校验 1/5：函数与调用点（应为 1 个定义 + 3 个调用）---"
           grep -n 'func_tsl_fixes' "$F"
 
-          echo "--- 校验 2/4：补丁差异（开头 60 行）---"
+          echo "--- 校验 2/5：补丁差异（开头 60 行）---"
           diff -u "$F.orig" "$F" | head -60 || true
 
-          echo "--- 校验 3/4：IPv6 组播修复块必须烤进去（br0 snooping / disable_ipv6）---"
+          echo "--- 校验 3/5：IPv6 组播修复块必须烤进去（br0 snooping / disable_ipv6）---"
           grep -n 'ipv6-mcast-fix: v1' "$F"
           grep -q 'echo 0 > /sys/class/net/br0/bridge/multicast_snooping' "$F" \
             || { echo "!! 缺 br0 multicast_snooping=0，AP 上 5G 客户端的 IPv6 RA 会断"; exit 1; }
           grep -q 'ipv6/conf/\$_if/disable_ipv6' "$F" \
             || { echo "!! 缺 disable_ipv6=0 循环"; exit 1; }
 
-          echo "--- 校验 4/4：IPv6 DAD 探测拦截块（无线中继下防 dadfailed）---"
+          echo "--- 校验 4/5：IPv6 DAD 探测拦截块（无线中继下防 dadfailed）---"
           grep -n 'ipv6-dad-guard: v1' "$F"
           grep -q -- '--ip6-icmp-type 135' "$F" \
             || { echo "!! 缺 NS(type 135) 匹配 —— DAD 探测拦不下来"; exit 1; }
@@ -136,6 +136,33 @@ jobs:
             echo "!! 用了 command -v —— 本机 busybox sh 不支持(exit 127)，规则会静默不生效"; exit 1
           fi
           echo "OK：DAD guard 已烤进 started_script.sh（只拦源 :: 的 NS，RA/mDNS 不受影响）"
+
+          echo "--- 校验 5/5：看门狗 v5 必须自带 DAD 防护自愈（否则无线重启后静默失效）---"
+          # 实测：AP 做全量无线重启（保存无线设置 / radio*_restart）时内核会把
+          # ebtables 卸掉，syslog 出现 "Ebtables v2.0 unregistered"，DADGUARD 连规则
+          # 一起消失；started_script.sh 只在开机跑一次，不会重建 —— 故障静默复发。
+          # v5 的 ap_watchdog.sh 每 30 秒核一次，缺了就重建。这几项缺一不可。
+          grep -n 'watchdog-version: v5-generic' "$F"
+          grep -q 'watchdog-version: v5-generic' "$F" \
+            || { echo "!! 看门狗不是 v5 —— 无线重启后 DADGUARD 不会自动重建"; exit 1; }
+          grep -q 'ensure_dad_guard()' "$F" \
+            || { echo "!! 缺 ensure_dad_guard() 定义"; exit 1; }
+          # 定义 1 处 + 调用 3 处（soft_recover 末尾 / check_once 开头 / 主循环分段等待）
+          _ndg=$(grep -c 'ensure_dad_guard' "$F" || true)
+          test "${_ndg:-0}" -ge 4 \
+            || { echo "!! ensure_dad_guard 只有 ${_ndg:-0} 处（需 1 定义 + 3 调用）"; exit 1; }
+          grep -q '_eb -L DADGUARD' "$F" \
+            || { echo "!! 自愈里没有「核对链是否存在」的判据，会每轮盲重建"; exit 1; }
+          grep -q 'ebtable_filter' "$F" \
+            || { echo "!! 自愈缺 /proc/modules 快路径（模块被卸载时会白跑 ebtables）"; exit 1; }
+          # 自愈里的循环变量必须与主循环 _w 不冲突，否则会把轮询计数改坏
+          grep -q 'for _dk in 1 2 3' "$F" \
+            || { echo "!! FORWARD 去重循环变量不是 _dk（会与主循环变量撞车）"; exit 1; }
+          if grep -q 'watchdog-version: v4-generic' "$F" ; then
+            echo "!! 残留 v4 标记 —— 已装 v4 的机器不会被升级成 v5"; exit 1
+          fi
+          echo "OK：看门狗 v5 自带 DADGUARD 自愈（30 秒粒度，重启无线后必补）"
+
           echo "--- 附加校验：reboot 兜底必须是 v4（平时 6 秒 / 刷机时 180 秒）---"
           grep -n 'sysrq-fallback: v' "$F"
           grep -q 'sysrq-fallback: v4' "$F" \
@@ -289,7 +316,8 @@ jobs:
             echo "OK：固件 www 里没有 Advanced_SQM.asp"
           fi
           echo "--- 复核 2：看门狗脚本应已打进 storage 模板 ---"
-          grep -c 'watchdog-version: v4-generic' trunk/user/scripts/files/sbin/mtd_storage.sh || true
+          grep -c 'watchdog-version: v5-generic' trunk/user/scripts/files/sbin/mtd_storage.sh || true
+          grep -c 'ensure_dad_guard' trunk/user/scripts/files/sbin/mtd_storage.sh || true
           echo "--- 复核 3：5G 带宽默认值（应看到 K2P 走 20/40MHz 分支）---"
           grep -n -A4 'BOARD_HAS_5G_11AC && !defined(BOARD_K2P)' trunk/user/shared/src/defaults.c || true
           echo "--- 复核 4：K2P 出厂双频都是开放网络（无密码）---"
