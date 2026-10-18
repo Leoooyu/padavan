@@ -57,17 +57,34 @@ patch_k2p_wifi_defaults.py
    钉死 149 后开机即在主路由信道上，回程关联更快、链路更稳。
    ⚠️ 5.8G 频段（149~165）在国内是开放频段，27dBm 功率不受限制；且 5.8G 比 5.2G 更安静。
 
-   ⚠️ 只影响「恢复出厂 / 不保留配置刷机」之后的初始状态：
-      * 「保留配置」刷机时 nvram 不动，手上已设好密码的机器**完全不受影响**；
+11) `rt_TxPower` : 100 -> 20   【v6 新增：2.4G 功率默认 20%】
+12) `wl_TxPower` : 100 -> 40   【v6 新增：5G 功率默认 40%】
+   与主路由 QWRT 的 `def_txp=20 / 40` 完全一致（同一颗 MT76 驱动，txpower 是
+   **0~100 的百分比**，不是 dBm：实测 2.4G 20% ≈ 21~24dBm、5G 40% ≈ 24dBm、100% = 27dBm）。
+   三台机器都开满 27dBm 时覆盖重叠太狠，客户端根本没有换 AP 的理由 —— 这正是
+   「漫游不灵敏」的第一号原因。统一降到 20/40 才能造出覆盖边界。
+
+   ⚠️ 2.4G 是**回程**频段（apclix0 连主路由），功率压到 20% 会同时压低上行。
+      实测 AP 与主路由距离在 5 米内时链路余量足够；若回程 RSSI 掉到 -70dBm 以下，
+      把这一项改回 100（或只把 2.4G 改回 100、5G 保持 40）。
+
+**K/V/R 双频段终局（与主路由 QWRT 完全一致）**：
+  * 2.4G：`rt_HT_80211KV = 0`（K/V 关）+ `rt_HT_80211R = 0`（R 关）
+  * 5G  ：`wl_HT_80211KV = 1`（K/V 开）+ `wl_HT_80211R = 0`（R 关）
+  2.4G 只做回程、不服务客户端，K/V 开着没有任何收益；5G 才是客户端漫游的频段。
+  R 关是因为 AP 是 Padavan/MTK、主路由是 QWRT，跨厂商 FT 不可靠，K/V 重关联已经够快。
+
+   ⚠️ 以上全部只影响「恢复出厂 / 不保留配置刷机」之后的初始状态：
+      * 「保留配置」刷机时 nvram 不动，手上已设好参数的机器**完全不受影响**；
       * 也**不影响**无线回程（apcli0）—— 上级 SSID/口令走 `wl_sta_ssid` /
         `wl_sta_wpa_psk`，那是另一组键。
    ⚠️ 出厂开放意味着「恢复出厂后被别人蹭网」的风险自负。不想要就把
       OPEN_DEFAULT_WIFI 改成 False（恢复成原厂的 psk + 预置口令）。
 
 **没有改的项**（逐条比对过，Padavan 出厂默认已经与 AP 实测值一致）：
-  TxPower=100、wl_txbf=1、wl_ldpc=2、wl_mumimo=0、wl_HT_BAWinSize=256、wl_HT_AMSDU=1、
+  wl_txbf=1、wl_ldpc=2、wl_mumimo=0、wl_HT_BAWinSize=256、wl_HT_AMSDU=1、
   wl_HT_AutoBA=1、wl_PktAggregate=1、wl_rts=2347、wl_frag=2346、wl_bcn=100、wl_dtim=1、
-  wl_preamble=1、wl_HT_80211KV=1、wl_HT_80211R=0、wl_stream_tx/rx=2/2、wl_gmode=4、wl_greenap=0。
+  wl_preamble=1、wl_stream_tx/rx=2/2、wl_gmode=4、wl_greenap=0。
   （5G 的「短保护间隔 SGI」根本不是 nvram 项，由驱动默认开，无需固化。）
 
 只改「没有该 nvram 项时写入的默认值」——设备上已手工设过的值不受影响。
@@ -96,7 +113,8 @@ OLD_COND = "#if BOARD_HAS_5G_11AC"
 NEW_COND = "#if BOARD_HAS_5G_11AC && !defined(BOARD_K2P)"
 BW80_LINE = '{ "wl_HT_BW", "2" },'
 BW40_LINE = '{ "wl_HT_BW", "1" },'
-TXPWR_LINE = '{ "wl_TxPower", "100" },'
+TXPWR_LINE = '{ "wl_TxPower", "100" },'          # 5G 原厂默认 100
+TXPWR24_LINE = '{ "rt_TxPower", "100" },'        # 2.4G 原厂默认 100
 
 
 def fail(msg):
@@ -153,6 +171,28 @@ def wrap_k2p_any(src, old_decl, new_decl, new_tail, label):
     return out, "已改：%s -> K2P 用 %s" % (old_decl, new_decl)
 
 
+def pin_default(src, key, want, new_tail, label):
+    """把某个 nvram 默认值**钉成** want（want 只会是 "0" / "1"）。
+
+    三种情况：
+      * 已经是 want      -> 跳过（幂等，不打第二遍补丁）
+      * 是另一个布尔值   -> 用 #ifdef BOARD_K2P 三行结构改掉
+      * 源码里没有这个键 -> 只告警、不中止（上游可能改过名字，让人去看一眼）
+    """
+    if re.search(r'(?m)^[ \t]*\{ "%s", "%s" \},' % (re.escape(key), want), src):
+        print("[跳过] %s 已经是 %s" % (label, want))
+        return src, False
+    other = "0" if want == "1" else "1"
+    if re.search(r'(?m)^[ \t]*\{ "%s", "%s" \},' % (re.escape(key), other), src):
+        src, msg = wrap_k2p_any(src, '{ "%s", "%s" },' % (key, other),
+                                '{ "%s", "%s" },' % (key, want), new_tail, label)
+        print("[%s]" % msg)
+        return src, True
+    print("[警告] 源码里找不到 %s（既不是 %s 也不是 %s）—— 跳过，请人工核对"
+          % (key, want, other))
+    return src, False
+
+
 def main():
     path = sys.argv[1] if len(sys.argv) > 1 else DEFAULT_PATH
     if not os.path.isfile(path):
@@ -167,6 +207,8 @@ def main():
         fail("源码里找不到 %s（else 分支）—— 上游结构可能已变，请人工核对" % BW40_LINE)
     if TXPWR_LINE not in src:
         fail("源码里找不到 %s —— 5G 默认功率不是 100，请人工确认后再编译" % TXPWR_LINE)
+    if TXPWR24_LINE not in src:
+        fail("源码里找不到 %s —— 2.4G 默认功率不是 100，请人工确认后再编译" % TXPWR24_LINE)
 
     # 5G 参数必须都在 `#if BOARD_HAS_5G_RADIO` 段里；定位它以便后面做位置校验
     i_5g = src.find("#if BOARD_HAS_5G_RADIO")
@@ -300,6 +342,46 @@ def main():
         print("[%s]" % msg)
         changed.append("wl_channel=149")
 
+    # ---------- 3g) rt_TxPower (2.4G) ----------
+    if re.search(r'(?m)^[ \t]*\{ "rt_TxPower", "20" \},', src):
+        print("[跳过] rt_TxPower 已经是 20")
+    else:
+        src, msg = wrap_k2p_any(
+            src,
+            '{ "rt_TxPower", "100" },',
+            '{ "rt_TxPower", "20" },',
+            "\t\t\t/* TX power % — K2P：2.4G 默认 20%，与 QWRT 主路由一致 */",
+            "rt_TxPower(2.4G)",
+        )
+        print("[%s]" % msg)
+        changed.append("rt_TxPower=20")
+
+    # ---------- 3h) wl_TxPower (5G) ----------
+    if re.search(r'(?m)^[ \t]*\{ "wl_TxPower", "40" \},', src):
+        print("[跳过] wl_TxPower 已经是 40")
+    else:
+        src, msg = wrap_k2p_any(
+            src,
+            '{ "wl_TxPower", "100" },',
+            '{ "wl_TxPower", "40" },',
+            "\t\t\t/* TX power % — K2P：5G 默认 40%，与 QWRT 主路由一致 */",
+            "wl_TxPower(5G)",
+        )
+        print("[%s]" % msg)
+        changed.append("wl_TxPower=40")
+
+    # ---------- 3i) K/V/R 收口：2.4G = 0/0/0，5G = 1/1/0 ----------
+    # 2.4G 的 K/V 已在 3e 改成 0；这里把剩下三个「应为」的值也钉住。
+    # 原厂默认就是这些值，所以正常情况下全是「跳过」——它们是防止上游改默认值的护栏。
+    for key, want, tail in (
+        ('wl_HT_80211KV', "1", "\t\t/* 802.11K/V — K2P：5G 必须开，客户端漫游靠它 */"),
+        ('rt_HT_80211R', "0", "\t\t/* 802.11R — K2P：2.4G 关（跨厂商 FT 不可靠） */"),
+        ('wl_HT_80211R', "0", "\t\t/* 802.11R — K2P：5G 关（跨厂商 FT 不可靠） */"),
+    ):
+        src, did = pin_default(src, key, want, tail, key)
+        if did:
+            changed.append("%s=%s" % (key, want))
+
     # ---------- 4) 5) 出厂 2.4G / 5G 删掉预置口令（默认开放）----------
     OPEN_JOBS = [
         ('{ "wl_auth_mode", "psk" },',
@@ -382,6 +464,23 @@ def main():
     else:
         fail("校验失败：找不到 K2P 的 wl_channel=149")
 
+    if re.search(r'(?m)^[ \t]*\{ "rt_TxPower", "20" \},', src):
+        print("[校验] rt_TxPower  -> 20（K2P 分支）✓")
+    else:
+        fail("校验失败：找不到 K2P 的 rt_TxPower=20")
+
+    if re.search(r'(?m)^[ \t]*\{ "wl_TxPower", "40" \},', src):
+        print("[校验] wl_TxPower  -> 40（K2P 分支）✓")
+    else:
+        fail("校验失败：找不到 K2P 的 wl_TxPower=40")
+
+    # K/V/R 终局：2.4G 0/0/0，5G 1/1/0
+    for key, want in (('rt_HT_80211KV', "0"), ('wl_HT_80211KV', "1"),
+                      ('rt_HT_80211R', "0"), ('wl_HT_80211R', "0")):
+        if not re.search(r'(?m)^[ \t]*\{ "%s", "%s" \},' % (key, want), src):
+            fail("校验失败：找不到 %s=%s" % (key, want))
+    print("[校验] K/V/R：2.4G = 0/0/0、5G = 1/1/0 ✓")
+
     if OPEN_DEFAULT_WIFI:
         for need in ('{ "wl_auth_mode", "open" },', '{ "wl_wpa_psk", "" },',
                      '{ "rt_auth_mode", "open" },', '{ "rt_wpa_psk", "" },'):
@@ -403,10 +502,11 @@ def main():
             if "#else" not in nxt or "#endif" not in nxt:
                 fail("预处理块不完整：第 %d 行 `#ifdef BOARD_K2P` 后面 5 行内找不到 #else/#endif" % (i + 1))
     print("[校验] %d 处 #ifdef BOARD_K2P 三行结构完整 ✓" % src.count("#ifdef BOARD_K2P"))
-    print("[校验] 5G 默认发射功率仍为 100（未改动）✓")
+    print("[校验] 双频段默认功率已钉 20/40（原厂 100/100）✓")
 
     print()
     print("OK：K2P 出厂默认 = %s" % (", ".join(changed) if changed else "（本次无变化）"))
+    print("OK：2.4G 信道 11 / 功率 20 / K-V-R 全关；5G 信道 149 / 功率 40 / K-V 开、R 关")
     if OPEN_DEFAULT_WIFI:
         print("OK：K2P 出厂 2.4G/5G = 开放网络（无密码）；其它机型仍是 psk + 1234567890")
     print("OK：其它 11AC 机型仍为 wl_HT_BW=2 / wl_wme=1，完全不受影响")

@@ -430,11 +430,11 @@ TSLEOF
 TSLEOF
 		chmod 755 "$SH"
 	fi
-	if ! grep -q "sysrq-fallback: v4" "$SH" ; then
-		# 先摘掉历史版本（v1/v2/更早的三秒版都可能残留），再重写。
-		# 判据**只用 ASCII**：先找含 `sysrq-trigger` 的那行，向上回溯到最近的 `if` 行
-		# 及其紧邻的注释行 = 块首；向下找第一个独立的 `fi` 行 = 块尾（v2 还要吃掉
-		# 紧随其后的 `# <<< sysrq-fallback <<<` 结束标记）。
+	if ! grep -q "sysrq-fallback: v5" "$SH" ; then
+		# 先摘掉历史版本（v1/v2/v3/v4 都可能残留），再重写。
+		# 判据**只用 ASCII**：块首 = 含 `sysrq-fallback: v` 的标记行，
+		# 块尾 = 含 `# <<< sysrq-fallback` 的结束标记行（v2 起都有）。
+		# 旧块没有结束标记时才退回「向下找整行 fi」的老判据。
 		# 为什么要缓冲整个文件：需要"向前看"再整体重排，单遍 awk 做不到删块。
 		# 为什么不用中文正则（如 /^# reboot 兜底/）：虽然实测 busybox awk 认得，
 		# 但 CJK 匹配依赖 locale/编码，换个 busybox 就可能失效 —— ASCII 判据无此风险。
@@ -443,22 +443,23 @@ TSLEOF
 			END {
 				k = 0
 				for (i = 1; i <= NR; i++)
-					if (index(L[i], "sysrq-trigger")) { k = i ; break }
+					if (index(L[i], "sysrq-fallback: v")) { k = i ; break }
 				if (!k) { for (i = 1; i <= NR; i++) print L[i] ; exit }
-				# 块首：从 k 往上找最近的 if 行，再吃掉紧邻的注释行
+				# 块首 = 标记行本身（v2 起块首就是 `# >>> sysrq-fallback: vN >>>`）
 				s = k
-				for (i = k; i >= 1; i--)
-					if (F[i] == "if") { s = i ; break }
 				# 注释行判据用 L[]（整行）而不是 F[]：块里有"只有 # 一行"的空注释，
 				# 那种行 NF=0、$1 为空，用字段判断会提前停下、导致块头残留。
 				# 用 POSIX 字符类 [[:space:]] 而不是 \\t —— \\t 在方括号里不可移植。
 				while (s > 1 && L[s-1] ~ /^[[:space:]]*#/) s--
-				# 块尾：从 k 往下找第一个"整行只有 fi"
-				e = NR
+				# 块尾 = 结束标记行；老块没有结束标记时退回「往下找整行 fi」
+				e = 0
 				for (i = k; i <= NR; i++)
-					if (F[i] == "fi" && N[i] == 1) { e = i ; break }
-				# v2 的结束标记要跟着块一起删，否则每次升级都多留一行
-				if (e < NR && L[e+1] ~ /^[[:space:]]*#/ && index(L[e+1], "sysrq-fallback")) e++
+					if (index(L[i], "# <<< sysrq-fallback")) { e = i ; break }
+				if (!e) {
+					e = NR
+					for (i = k; i <= NR; i++)
+						if (F[i] == "fi" && N[i] == 1) { e = i ; break }
+				}
 				for (i = 1; i < s; i++) print L[i]
 				for (i = e + 1; i <= NR; i++) print L[i]
 			}
@@ -466,7 +467,7 @@ TSLEOF
 			&& [ -s "/tmp/_sh_new.$$" ] && cat "/tmp/_sh_new.$$" > "$SH" && rm -f "/tmp/_sh_new.$$"
 		cat >> "$SH" <<'TSLEOF'
 
-# >>> sysrq-fallback: v4 >>>
+# >>> sysrq-fallback: v5 >>>
 # reboot 兜底（由固件/脚本安装）：正常关机优先，卡住后用内核 sysrq 强制重启。
 # 只对「重启」动作生效（$1=0），停机和关电不会误触发。
 #
@@ -475,31 +476,60 @@ TSLEOF
 #   启动失败 -> 落 Breed（实机踩过：AP1 反复蓝灯闪）。
 #
 # v4 补的坑：v3 只是「不打断写入」，但实测发现写完固件后 mtd_write 的自动重启
-#   有时根本不发生。结果是：固件其实写得完全正确（flash 内容与固件包逐字节一致），
-#   整机却停在「服务已停、无线已关」的半死状态 —— 管理页面打不开、指示灯变红，
-#   必须人工断电才起得来，看起来就像「刷机失败」。v4 改成：刷机时把兜底延到
-#   180 秒，3 分钟内没自己重启就替它重启。
+#   有时根本不发生，整机停在「服务已停、无线已关」的半死状态，只能人工断电。
+#
+# v5 修 v4 的两个问题：
+#   ① v4 一律干等满 180 秒 —— 用户盯着网页 3 分钟没动静，以为刷机失败。
+#      v5 改成盯着 mtd_write 进程：它一退出、6 秒内还没重启就立刻接管。
+#      正常刷机 40~60 秒就能自愈，不用干等 3 分钟。
+#   ② v4 先发 sysrq-s 再发 sysrq-b。如果 mtd_write 把 flash 写卡住，
+#      sysrq-s 会永久阻塞在同步上，永远走不到 b —— 兜底整条失效。
+#      v5 把 sync 丢到后台、主路径直接发 b，绝不被 s 拖住。
 #
 # 为什么必须 trap：init 跑完关机脚本后会执行 kill(-1, SIGTERM) 广播 SIGTERM，
-# 不加 trap 的话这个后台兜底会被一起杀掉、等于没装（真机实测：无 trap 的 subshell
-# 收到 TERM 后，后面的命令一条都不执行）。trap 之后 init 就杀不动它了。
+# 不加 trap 的话这个后台兜底会被一起杀掉、等于没装。
 # 为什么用时间戳：kill(-1) 会把 sleep 子进程一起收掉，裸 sleep 会立刻返回、
-# 导致兜底提前触发；改成"等一个绝对时刻"，无论中途被打断几次都保证等够时长。
+# 导致兜底提前触发；改成按绝对时刻计时，无论中途被打断几次都等够时长。
 if [ "$1" = "0" ] ; then
-	_sz=0
-	[ -f /tmp/linux.trx ] && _sz=$(wc -c < /tmp/linux.trx 2>/dev/null)
-	# 默认 6 秒；正在刷机（/tmp/linux.trx > 1MB）就延到 180 秒，绝不打断 mtd_write
-	_t=6
-	[ "${_sz:-0}" -gt 1000000 ] && _t=180
+	_flash=0
+	if [ -f /tmp/linux.trx ] ; then
+		_sz=$(wc -c < /tmp/linux.trx 2>/dev/null)
+		[ "${_sz:-0}" -gt 1000000 ] && _flash=1
+	fi
 	sync
+	# double-fork：外层子 shell 立刻退出，让守护进程变成 init 的孤儿。
+	# 单层 `( ... ) &` 在父 shell 退出时会被 SIGHUP/进程组信号带走（实测会），
+	# 变成孤儿之后就没人杀得掉它了 —— 这是兜底能真正生效的前提。
+	(
 	(
 		trap '' TERM INT HUP
-		_end=$(( $(date +%s) + _t ))
-		while [ "$(date +%s)" -lt "$_end" ] ; do sleep 1 2>/dev/null ; done
-		echo 1 > /proc/sys/kernel/sysrq
-		echo s > /proc/sysrq-trigger
-		echo b > /proc/sysrq-trigger
-	) &
+		_start=$(date +%s)
+		_idle=0
+		while : ; do
+			sleep 1 2>/dev/null
+			_now=$(date +%s)
+			if [ "$_flash" = "1" ] ; then
+				# 刷机中：mtd_write 还在写就绝不动手；写完了没重启才接管
+				if ps 2>/dev/null | grep -q '[m]td_write' ; then
+					_idle=0
+				else
+					_idle=$((_idle + 1))
+					# 至少等够 60 秒（正常写盘上限），之后进程消失 6 秒就接管
+					if [ "$_idle" -ge 6 ] && [ $((_now - _start)) -ge 60 ] ; then break ; fi
+				fi
+				# 绝对上限 240 秒：mtd_write 卡死也要把机器捞回来
+				[ $((_now - _start)) -ge 240 ] && break
+			else
+				# 普通重启：6 秒
+				[ $((_now - _start)) -ge 6 ] && break
+			fi
+		done
+		sync 2>/dev/null &
+		sleep 1
+		echo 1 > /proc/sys/kernel/sysrq 2>/dev/null
+		echo b > /proc/sysrq-trigger 2>/dev/null
+	) </dev/null >/dev/null 2>&1 &
+	) </dev/null >/dev/null 2>&1
 fi
 # <<< sysrq-fallback <<<
 TSLEOF
