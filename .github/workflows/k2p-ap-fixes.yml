@@ -139,14 +139,14 @@ jobs:
           fi
           echo "OK：DAD guard 已烤进 started_script.sh（只拦源 :: 的 NS，RA/mDNS 不受影响）"
 
-          echo "--- 校验 5/5：看门狗 v5 必须自带 DAD 防护自愈（否则无线重启后静默失效）---"
+          echo "--- 校验 5/5：看门狗 v6 必须自带 DAD 防护自愈（否则无线重启后静默失效）---"
           # 实测：AP 做全量无线重启（保存无线设置 / radio*_restart）时内核会把
           # ebtables 卸掉，syslog 出现 "Ebtables v2.0 unregistered"，DADGUARD 连规则
           # 一起消失；started_script.sh 只在开机跑一次，不会重建 —— 故障静默复发。
-          # v5 的 ap_watchdog.sh 每 30 秒核一次，缺了就重建。这几项缺一不可。
-          grep -n 'watchdog-version: v5-generic' "$F"
-          grep -q 'watchdog-version: v5-generic' "$F" \
-            || { echo "!! 看门狗不是 v5 —— 无线重启后 DADGUARD 不会自动重建"; exit 1; }
+          # v5 起 ap_watchdog.sh 每 30 秒核一次，缺了就重建；v6 再把判据做准。
+          grep -n 'watchdog-version: v6-generic' "$F"
+          grep -q 'watchdog-version: v6-generic' "$F" \
+            || { echo "!! 看门狗不是 v6 —— 无线重启后 DADGUARD 不会自动重建"; exit 1; }
           grep -q 'ensure_dad_guard()' "$F" \
             || { echo "!! 缺 ensure_dad_guard() 定义"; exit 1; }
           # 定义 1 处 + 调用 3 处（soft_recover 末尾 / check_once 开头 / 主循环分段等待）
@@ -160,10 +160,31 @@ jobs:
           # 自愈里的循环变量必须与主循环 _w 不冲突，否则会把轮询计数改坏
           grep -q 'for _dk in 1 2 3' "$F" \
             || { echo "!! FORWARD 去重循环变量不是 _dk（会与主循环变量撞车）"; exit 1; }
-          if grep -q 'watchdog-version: v4-generic' "$F" ; then
-            echo "!! 残留 v4 标记 —— 已装 v4 的机器不会被升级成 v5"; exit 1
+          # ---- v6 三项（缺一不可，否则装到机器上等于没改）----
+          # v6-1：规则数按实际无线接口数动态算，不再写死 8
+          grep -q '_need=$((_need + 2))' "$F" \
+            || { echo "!! v6-1 缺：规则数没按实际无线接口数动态计算"; exit 1; }
+          grep -q '\-ge "\$_need"' "$F" \
+            || { echo "!! v6-1 缺：快路径没拿 \$_need 做判据"; exit 1; }
+          if grep -q '\-ge 8 ' "$F" ; then
+            echo "!! v6-1 残留：还在用写死的 8 条判据"; exit 1
           fi
-          echo "OK：看门狗 v5 自带 DADGUARD 自愈（30 秒粒度，重启无线后必补）"
+          # v6-2：MISS_LIMIT 必须是 2（大流量下不白重启）
+          grep -q '^MISS_LIMIT=2' "$F" \
+            || { echo "!! v6-2 缺：MISS_LIMIT 不是 2（回程打满时会误重启）"; exit 1; }
+          # v6-3：主循环用 date +%s 算剩余时间；老的 _w 累加写法必须消失
+          grep -q '_left=$(( INTERVAL - ' "$F" \
+            || { echo "!! v6-3 缺：主循环没用 date +%s 精确计时"; exit 1; }
+          if grep -q '_w=$((_w + 30))' "$F" ; then
+            echo "!! v6-3 残留：主循环还是老的 _w 累加写法"; exit 1
+          fi
+          if grep -q 'watchdog-version: v5-generic' "$F" ; then
+            echo "!! 残留 v5 标记 —— 已装 v5 的机器不会被升级成 v6"; exit 1
+          fi
+          if grep -q 'watchdog-version: v4-generic' "$F" ; then
+            echo "!! 残留 v4 标记 —— 已装 v4 的机器不会被升级成 v6"; exit 1
+          fi
+          echo "OK：看门狗 v6 = DADGUARD 自愈（动态规则数 / 30 秒粒度 / 精确节拍）"
 
           echo "--- 附加校验：reboot 兜底必须是 v5（平时 6 秒 / 刷机盯 mtd_write 自愈）---"
           grep -n 'sysrq-fallback: v' "$F"
@@ -343,13 +364,16 @@ jobs:
             echo "OK：固件 www 里没有 Advanced_SQM.asp"
           fi
           echo "--- 复核 2：看门狗脚本应已打进 storage 模板 ---"
-          grep -c 'watchdog-version: v5-generic' trunk/user/scripts/files/sbin/mtd_storage.sh || true
+          grep -c 'watchdog-version: v6-generic' trunk/user/scripts/files/sbin/mtd_storage.sh || true
           grep -c 'ensure_dad_guard' trunk/user/scripts/files/sbin/mtd_storage.sh || true
           echo "--- 复核 3：无线默认值应与主路由 QWRT 一致 ---"
-          echo "    2.4G：信道 11 / 功率 20 / K,V,R 全关；5G：信道 149 / 功率 40 / K,V 开、R 关"
+          echo "    功率 100 / 2.4G：信道 11 / HT20(rt_HT_BW=0) / K,V,R 全关"
+          echo "    　　　　　5G  ：信道 149 / 40MHz(wl_HT_BW=1) / K,V 开、R 关"
           grep -n -A4 'BOARD_HAS_5G_11AC && !defined(BOARD_K2P)' trunk/user/shared/src/defaults.c || true
-          grep -n -B1 -A2 '"rt_TxPower", "20"' trunk/user/shared/src/defaults.c || true
-          grep -n -B1 -A2 '"wl_TxPower", "40"' trunk/user/shared/src/defaults.c || true
+          grep -n -B1 -A2 '"rt_HT_BW", "0"' trunk/user/shared/src/defaults.c || true
+          grep -n -B1 -A2 '"wl_HT_BW", "1"' trunk/user/shared/src/defaults.c || true
+          grep -n -B1 -A2 '"rt_TxPower", "100"' trunk/user/shared/src/defaults.c || true
+          grep -n -B1 -A2 '"wl_TxPower", "100"' trunk/user/shared/src/defaults.c || true
           grep -n -B1 -A2 '"rt_HT_80211KV", "0"' trunk/user/shared/src/defaults.c || true
           grep -n -B1 -A2 '"wl_HT_80211KV", "1"' trunk/user/shared/src/defaults.c || true
           echo "--- 复核 4：K2P 出厂双频都是开放网络（无密码）---"
