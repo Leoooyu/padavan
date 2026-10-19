@@ -6,13 +6,15 @@
 做两件事：
   1) 定义 func_tsl_fixes()：
      - 写入 /etc/storage/ap_watchdog.sh（**通用版**看门狗：探测目标 = 本机实际默认网关，
-       默认每 5 分钟一次，一次不通即重启；带 MIN_UPTIME 护栏防打转）
-       * 脚本头带 `watchdog-version: v5-generic` 标记，旧版会自动升级
+       默认每 5 分钟一次，连续两轮不通才重启；带 MIN_UPTIME 护栏防打转）
+       * 脚本头带 `watchdog-version: v6-generic` 标记，旧版会自动升级
        * 重启逻辑移植自 QWRT：graceful = 优雅重启 + 6 秒 sysrq 兜底（默认）
        * v5 新增 ensure_dad_guard()：每轮核对 DADGUARD 链，缺了自动重建。
          AP 做全量无线重启时内核会卸载 ebtables（syslog: "Ebtables v2.0 unregistered"），
          DADGUARD 连规则一起消失，而 started_script.sh 只在开机跑一次不会补 —— 
          没有这层自愈，AP 重启过无线之后 IPv6 故障会静默复发。
+       * v6 三处稳健性修正：规则数按实际无线接口数动态算（不再写死 8）、
+         MISS_LIMIT 1->2（大流量下不误重启）、主循环用 date +%s 精确计时。
      - 写入 /etc/storage/reboot-hard.sh（QWRT 的 /usr/bin/reboot-hard：内核级紧急重启）
      - 写入 /etc/storage/reboot-safe.sh（QWRT 的 /sbin/reboot 包装器：优雅优先 + 兜底）
      - 给 started_script.sh 追加启动钩子（pid 文件 + start-stop-daemon，不依赖 cron）
@@ -39,19 +41,29 @@ BLOCK = r'''
 func_tsl_fixes()
 {
 	WD="/etc/storage/ap_watchdog.sh"
-	# 带版本标记：缺失或旧版时自动写入/升级；已是 v5 就不动
-	if [ ! -f "$WD" ] || ! grep -q "watchdog-version: v5-generic" "$WD" ; then
+	# 带版本标记：缺失或旧版时自动写入/升级；已是 v6 就不动
+	if [ ! -f "$WD" ] || ! grep -q "watchdog-version: v6-generic" "$WD" ; then
 		cat > "$WD" <<'TSLEOF'
 #!/bin/sh
 # ================= 桥接看门狗（通用版）=================
 # 上级路由失联 -> 重启本机。由 install-ap-fixes.py 安装。
-# watchdog-version: v5-generic
+# watchdog-version: v6-generic
 #
 # v5 相对 v4：新增 ensure_dad_guard()，每轮核对 IPv6 DAD 防护链并自愈。
 #   AP 做全量无线重启时内核会卸载 ebtables 模块（syslog 里能看到
 #   "Ebtables v2.0 unregistered"），DADGUARD 链连规则一起消失；
 #   started_script.sh 只在开机跑一次、不会重建，于是之后再走无线中继的
 #   电视/盒子又会 dadfailed、拿不到 IPv6。自愈这层就是为了堵这个洞。
+#
+# v6 相对 v5（三处稳健性修正，正常网络下行为不变）：
+#   1) 快路径的"规则数 >= 8"改成按**实际存在的无线接口数 × 2** 动态计算。
+#      写死 8 只在 K2P（ra0/ra1/rax0/rax1 四口）成立；换机型或接口少起时
+#      永远凑不满 -> 每 30 秒白跑一次重建，而重建瞬间链是空的，等于自己
+#      制造 dadfailed 空窗。
+#   2) MISS_LIMIT 1 -> 2：一轮 = 3 次 × 2 个包，回程被大流量打满时连丢 6 个
+#      包并不稀奇；给多一轮（约 5 分钟）再判，避免白重启整机。
+#   3) 主循环用 date +%s 算剩余时间来分段 sleep：INTERVAL 不是 30 的整数倍
+#      时也是准的（原来 _w 每次 +30，INTERVAL=100 会实睡 120 秒）。
 #
 # 重启逻辑移植自之前的 QWRT 固件（MTK 平台正常关机流程可能卡死）：
 #   graceful = 优雅重启优先，同时武装一个内核级兜底定时器
@@ -61,7 +73,7 @@ func_tsl_fixes()
 # 可调参数（只改这一段即可）：
 GW_OVERRIDE=""	# 留空 = 自动取本机默认网关；也可写死，如 "192.168.2.1"
 INTERVAL=300		# 检查间隔（秒）：300 = 5 分钟，600 = 10 分钟
-MISS_LIMIT=1		# 连续几轮不通就重启：1 = 一次不通就重启
+MISS_LIMIT=2		# 连续几轮不通就重启：2 = 连续两轮（约 10 分钟）才重启
 PING_TRIES=3		# 一轮内最多试几次（每次 2 个包、2 秒超时）
 SOFT_FIRST=0		# 1 = 重启前先试软恢复（重启无线 + 补挂网桥，多花约 30 秒）
 MIN_UPTIME=300		# 本机启动不足这么多秒时，不通也不重启（防打转）
@@ -116,11 +128,20 @@ ensure_dad_guard() {
 	[ -x "$_eb" ] || _eb=/sbin/ebtables
 	# 只能用路径判断，不能用 `command -v`：本机 /bin/sh 是 busybox，返回 127
 	[ -x "$_eb" ] || return 0
-	# 快路径：模块还在 + 链里 8 条规则 + FORWARD 挂着跳转 -> 判定完好，什么都不做。
+	# 期望规则数 = **实际存在的无线接口数 × 2**（每个口 inbound/outbound 各一条）。
+	# 不能写死 8：换机型或驱动少起接口时永远凑不满 -> 每 30 秒白跑一次重建，
+	# 而重建瞬间链是空的，等于自己制造一个 dadfailed 空窗。
+	_need=0
+	for _dif in ra0 rax0 ra1 rax1 ; do
+		[ -e "/sys/class/net/$_dif" ] && _need=$((_need + 2))
+	done
+	# 一个无线口都没有（驱动还没起）-> 这轮没东西可护，等下一轮
+	[ "$_need" -gt 0 ] || return 0
+	# 快路径：模块还在 + 规则数够 + FORWARD 挂着跳转 -> 判定完好，什么都不做。
 	# 先看 /proc/modules 是为了避免在「模块已被卸载」时白跑一次 ebtables。
 	if grep -q '^ebtable_filter' /proc/modules 2>/dev/null ; then
 		_n=$($_eb -L DADGUARD 2>/dev/null | grep -c 'icmp-type')
-		if [ "${_n:-0}" -ge 8 ] && $_eb -L FORWARD 2>/dev/null | grep -q DADGUARD ; then
+		if [ "${_n:-0}" -ge "$_need" ] && $_eb -L FORWARD 2>/dev/null | grep -q DADGUARD ; then
 			return 0
 		fi
 	fi
@@ -253,11 +274,15 @@ case "$1" in
 			# radio*_restart）会把 ebtables 模块卸载、规则全丢，用 30 秒粒度
 			# 才能保证「重启完刚连上 WiFi 的电视」不会在那个空窗里 dadfailed。
 			# 冗余调用无害：快路径只读 /proc/modules，规则齐就立即返回。
-			_w=0
-			while [ "$_w" -lt "$INTERVAL" ] ; do
-				sleep 30
+			# 用 date +%s 算剩余时间，sleep 取 min(30, 剩余)：既保持 30 秒的
+			# DAD 核对粒度，又保证 INTERVAL 非 30 整数倍时不会多等一轮。
+			_t0=$(date +%s)
+			while : ; do
+				_left=$(( INTERVAL - ( $(date +%s) - _t0 ) ))
+				[ "$_left" -le 0 ] && break
+				[ "$_left" -gt 30 ] && _left=30
+				sleep "$_left"
 				ensure_dad_guard
-				_w=$((_w + 30))
 			done
 		done ;;
 esac
